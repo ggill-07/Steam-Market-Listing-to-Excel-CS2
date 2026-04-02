@@ -82,7 +82,8 @@ def steam_render_page(
     response.raise_for_status()
     payload = response.json()
     if not payload.get("success", False):
-        raise RuntimeError(f"Steam render endpoint returned unsuccessful response for start={start}")
+        raise RuntimeError(
+            f"Steam render endpoint returned unsuccessful response for start={start}")
     return payload
 
 
@@ -159,7 +160,8 @@ def iter_listings(
         if not listing_info:
             break
 
-        assets = payload.get("assets", {}).get(str(STEAM_APP_ID), {}).get(str(STEAM_CONTEXT_ID), {})
+        assets = payload.get("assets", {}).get(
+            str(STEAM_APP_ID), {}).get(str(STEAM_CONTEXT_ID), {})
 
         page_number = (start // PAGE_SIZE) + 1
         for listing_id, listing in listing_info.items():
@@ -167,7 +169,8 @@ def iter_listings(
             asset_id = str(asset.get("id", ""))
             asset_payload = assets.get(asset_id, {})
 
-            inspect_link = extract_inspect_link(asset_payload, listing_id=listing_id, asset_id=asset_id)
+            inspect_link = extract_inspect_link(
+                asset_payload, listing_id=listing_id, asset_id=asset_id)
 
             price_cents = (listing.get("converted_price") or listing.get("price") or 0) + (
                 listing.get("converted_fee") or listing.get("fee") or 0
@@ -241,10 +244,14 @@ def main() -> None:
         "market_hash_name",
         help='Exact Steam market hash name, e.g. "AK-47 | Redline (Field-Tested)"',
     )
-    parser.add_argument("-o", "--output", default="steam_listings.xlsx", help="Output Excel filename")
-    parser.add_argument("--currency", type=int, default=1, help="Steam currency ID (default: 1 for USD)")
-    parser.add_argument("--country", default="US", help="Steam country code (default: US)")
-    parser.add_argument("--language", default="english", help="Steam language (default: english)")
+    parser.add_argument(
+        "-o", "--output", default="steam_listings.xlsx", help="Output Excel filename")
+    parser.add_argument("--currency", type=int, default=1,
+                        help="Steam currency ID (default: 1 for USD)")
+    parser.add_argument("--country", default="US",
+                        help="Steam country code (default: US)")
+    parser.add_argument("--language", default="english",
+                        help="Steam language (default: english)")
 
     args = parser.parse_args()
 
