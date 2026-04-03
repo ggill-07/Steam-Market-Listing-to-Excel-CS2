@@ -23,5 +23,5 @@ out/
 # Secrets / local config
 .env
 
-#Ignore File
+#Ignore Files
 .src/*.ipynb
