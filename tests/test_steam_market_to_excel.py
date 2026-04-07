@@ -111,34 +111,7 @@ class TestBasicHelpers(unittest.TestCase):
 
 
 class TestFakeApiResponses(unittest.TestCase):
-    """Tests that use fake responses instead of real HTTP requests.
-
-    Mock objects let us pretend that Steam or the float API replied with the
-    exact data we want to test.
-    """
-
-    def test_fetch_float_metadata_converts_strings_to_real_types(self):
-        # Pretend this is the response object returned by requests.
-        fake_response = Mock()
-        fake_response.raise_for_status = Mock()
-        fake_response.json.return_value = {
-            "iteminfo": {
-                "floatvalue": "0.1234",
-                "paintseed": "321",
-                "stickers": [{"name": "a"}, {"name": "b"}],
-            }
-        }
-
-        # Pretend this is a requests session.
-        fake_session = Mock()
-        fake_session.get.return_value = fake_response
-
-        result = sme.fetch_float_metadata(fake_session, "steam://inspect")
-
-        self.assertEqual(result["float_value"], 0.1234)
-        self.assertEqual(result["paint_seed"], 321)
-        self.assertTrue(result["has_stickers"])
-        self.assertEqual(result["sticker_count"], 2)
+    """Tests that use fake responses instead of real HTTP requests."""
 
     @patch("steam_market_to_excel.time.sleep")
     def test_steam_render_page_retries_when_steam_rate_limits(self, mocked_sleep):
@@ -190,6 +163,19 @@ class TestFakeApiResponses(unittest.TestCase):
         self.assertIsNone(result["has_stickers"])
         self.assertIsNone(result["sticker_count"])
 
+    def test_extract_steam_metadata_counts_stickers_from_descriptions(self):
+        asset_payload = {
+            "descriptions": [
+                {"value": "Sticker: Crown (Foil)"},
+                {"value": "Sticker: Team Dignitas"},
+            ]
+        }
+
+        result = sme.extract_steam_metadata(asset_payload)
+
+        self.assertTrue(result["has_stickers"])
+        self.assertEqual(result["sticker_count"], 2)
+
 
 class TestListingAndExportFlow(unittest.TestCase):
     """Tests a larger chunk of the program with fake helper functions."""
@@ -228,19 +214,17 @@ class TestListingAndExportFlow(unittest.TestCase):
         # Here we replace the helper functions completely.
         # That means iter_listings() runs, but it receives predictable fake data.
         with patch("steam_market_to_excel.steam_render_page", return_value=fake_steam_payload):
-            with patch("steam_market_to_excel.fetch_float_metadata") as mocked_float:
-                rows = list(
-                    sme.iter_listings(
-                        session=Mock(),
-                        market_hash_name="AK-47 | Redline (Field-Tested)",
-                        currency=1,
-                        country="US",
-                        language="english",
-                        steam_page_delay=0,
-                        float_api_delay=0,
-                        steam_max_retries=1,
-                    )
+            rows = list(
+                sme.iter_listings(
+                    session=Mock(),
+                    market_hash_name="AK-47 | Redline (Field-Tested)",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_page_delay=0,
+                    steam_max_retries=1,
                 )
+            )
 
         self.assertEqual(len(rows), 1)
 
@@ -257,10 +241,8 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertIsNone(row.sticker_count)
         self.assertEqual(row.inspect_link, "steam://run/730//+csgo_econ_action_preview%20TOKEN123")
 
-        # The function sleeps twice in this path:
-        # once after the float metadata lookup, once after the page finishes.
+        # The function sleeps once after the page finishes.
         self.assertEqual(mocked_sleep.call_count, 1)
-        mocked_float.assert_not_called()
 
     def test_rows_to_dataframe_creates_expected_columns(self):
         rows = [

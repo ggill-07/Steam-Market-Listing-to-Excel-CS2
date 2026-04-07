@@ -12,7 +12,8 @@ Program flow in very plain English:
 3. main() calls iter_listings() to collect listing rows.
 4. iter_listings() asks Steam for one page of listings at a time.
 5. For each listing, iter_listings() tries to find an inspect link.
-6. If an inspect link exists, iter_listings() asks the float API for more data.
+6. iter_listings() reads float, paint seed, and some other details directly
+   from Steam's asset payload.
 7. iter_listings() creates a ListingRow object for each listing.
 8. rows_to_dataframe() turns those rows into a table.
 9. pandas saves the table to Excel.
@@ -20,7 +21,7 @@ Program flow in very plain English:
 If the program is "not working", these are the most likely places to inspect:
 - steam_render_page(): Steam may block, rate-limit, or change its response.
 - extract_inspect_link(): the inspect link may not exist in the place we expect.
-- fetch_float_metadata(): the float API may be down or may return different data.
+- extract_steam_metadata(): Steam may store metadata in a slightly different shape.
 - iter_listings(): Steam's JSON structure may have changed.
 
 Good beginner strategy for debugging:
@@ -39,6 +40,10 @@ from __future__ import annotations
 # It is what lets the script understand things like:
 # python script.py "item name" --country US
 import argparse
+
+# re is Python's regular-expression module.
+# We use it to find placeholder text like %propid:6% inside inspect links.
+import re
 
 # time gives us functions related to time.
 # We use time.sleep(...) to pause between web requests.
@@ -73,13 +78,16 @@ STEAM_CONTEXT_ID = 2
 # Steam returns 10 listings per page from the endpoint we are using.
 PAGE_SIZE = 10
 
-# These delays help us avoid hammering Steam or the float API too quickly.
+# This delay helps us avoid hammering Steam too quickly.
 DEFAULT_STEAM_PAGE_DELAY = 1.0
-DEFAULT_FLOAT_API_DELAY = 0.3
 
 # If Steam replies with HTTP 429 ("Too Many Requests"),
 # we will retry this many times before giving up.
 DEFAULT_STEAM_RETRIES = 5
+
+# Steam sometimes gives inspect links containing placeholders like %propid:6%.
+# This pattern lets us find those placeholders.
+PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 
 
 # @dataclass is a decorator.
@@ -133,19 +141,150 @@ def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
     return "Battle-Scarred"
 
 
-def normalize_inspect_link(raw_link: str, listing_id: str, asset_id: str) -> str:
-    """Fill in the placeholder values inside Steam's inspect link template.
+def coerce_float(value: Any) -> Optional[float]:
+    """Try to turn a value into a float.
 
-    Steam often gives links containing special placeholder text like:
+    "Coerce" here basically means:
+    "convert it if possible, otherwise return None instead of crashing".
+    """
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_int(value: Any) -> Optional[int]:
+    """Try to turn a value into an integer."""
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_asset_property_lookup(asset_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """Turn Steam's asset_properties list into a lookup dictionary.
+
+    Steam gives asset properties as a list of small dictionaries.
+    Looking through a list again and again is annoying, so this function turns:
+
+    [
+        {"propertyid": 1, ...},
+        {"propertyid": 2, ...}
+    ]
+
+    into something more convenient:
+
+    {
+        1: {...},
+        2: {...}
+    }
+    """
+
+    lookup: Dict[int, Dict[str, Any]] = {}
+
+    for prop in asset_payload.get("asset_properties", []) or []:
+        property_id = coerce_int(prop.get("propertyid"))
+        if property_id is not None:
+            lookup[property_id] = prop
+
+    return lookup
+
+
+def normalize_inspect_link(
+    raw_link: str,
+    listing_id: str,
+    asset_id: str,
+    asset_payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Fill in placeholders inside Steam's inspect link template.
+
+    Older inspect links may use:
     - %listingid%
     - %assetid%
 
-    This function swaps those placeholders with the real values for one listing.
+    Newer inspect links may also use:
+    - %propid:6%
+
+    The interesting part here is that %propid:6% does not mean:
+    "insert the literal text 6".
+
+    It means:
+    "look inside asset_properties for property id 6 and insert its value here".
     """
 
-    # str.replace(old, new) creates a new string.
-    # Here we do two replacements in one line.
-    return raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+    normalized = raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+    property_lookup = get_asset_property_lookup(asset_payload or {})
+
+    # Nested functions are functions defined inside other functions.
+    # This one is only used here.
+    def replace_propid(match: re.Match[str]) -> str:
+        property_id = int(match.group(1))
+        prop = property_lookup.get(property_id, {})
+
+        # Steam may store the property's value under one of several keys.
+        for key in ("string_value", "int_value", "float_value"):
+            value = prop.get(key)
+            if value is not None:
+                return str(value)
+
+        # If we cannot replace it, leave the placeholder text unchanged.
+        return match.group(0)
+
+    # PROPID_PATTERN.sub(function, text) means:
+    # "find every match in the text and replace it using the function".
+    return PROPID_PATTERN.sub(replace_propid, normalized)
+
+
+def extract_steam_metadata(asset_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Read float, paint seed, and sticker info directly from Steam's payload.
+
+    This is the big change from the older version of the script:
+    instead of asking a third-party float API, we now try to use Steam's own data.
+
+    From live testing, Steam appeared to store:
+    - property 2 -> float
+    - property 1 -> paint seed
+
+    That may not be guaranteed forever, but it is the current assumption the
+    script is built around.
+    """
+
+    property_lookup = get_asset_property_lookup(asset_payload)
+
+    float_value = coerce_float(property_lookup.get(2, {}).get("float_value"))
+    paint_seed = coerce_int(property_lookup.get(1, {}).get("int_value"))
+
+    # Steam also provides human-readable description blocks.
+    # We scan those looking for text like "Sticker: ...".
+    descriptions = asset_payload.get("descriptions", []) or []
+    sticker_count = sum(
+        1
+        for description in descriptions
+        if isinstance(description, dict)
+        and isinstance(description.get("value"), str)
+        and "Sticker:" in description["value"]
+    )
+
+    if sticker_count:
+        has_stickers: Optional[bool] = True
+    else:
+        has_stickers = None
+        sticker_count = None
+
+    return {
+        "float_value": float_value,
+        "paint_seed": paint_seed,
+        "has_stickers": has_stickers,
+        "sticker_count": sticker_count,
+    }
 
 
 def steam_render_page(
@@ -265,8 +404,12 @@ def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_i
 
     We look through both places and return the first usable inspect link.
 
-    If your script is getting rows but no float data, this function is a very
-    good place to debug.
+    This function now supports both:
+    - the older %assetid% style
+    - the newer %propid:6% style
+
+    If your script is getting rows but no inspect links, this is a very good
+    place to debug.
     """
 
     for key in ("market_actions", "actions"):
@@ -280,80 +423,18 @@ def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_i
             # its "link" value safely.
             link = action.get("link")
 
-            # We only care about the special link template that contains
-            # the asset placeholder.
-            if isinstance(link, str) and "%assetid%" in link:
-                return normalize_inspect_link(link, listing_id=listing_id, asset_id=asset_id)
+            # We accept either:
+            # - an older link containing %assetid%
+            # - or a newer preview link containing csgo_econ_action_preview
+            if isinstance(link, str) and ("csgo_econ_action_preview" in link or "%assetid%" in link):
+                return normalize_inspect_link(
+                    link,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                    asset_payload=asset_payload,
+                )
 
     return None
-
-
-def fetch_float_metadata(session: requests.Session, inspect_link: str) -> Dict[str, Any]:
-    """Fetch extra data for one listing from the float API.
-
-    The float API can tell us things like:
-    - float value
-    - paint seed
-    - sticker list
-
-    We convert some values into cleaner Python types before returning them.
-
-    If inspect links look correct but float data is missing, debug here.
-    """
-
-    # This is the base URL for the float API.
-    api_url = "https://api.csgofloat.com/"
-
-    # We send the inspect link as a query parameter named "url".
-    response = session.get(api_url, params={"url": inspect_link}, timeout=25)
-
-    # Stop if the HTTP response itself was bad.
-    response.raise_for_status()
-
-    # Turn the JSON response into a Python dictionary.
-    data = response.json()
-
-    # iteminfo is where the API keeps the data we care about.
-    # If iteminfo is missing, we use {} so the program does not crash here.
-    item_info = data.get("iteminfo", {})
-
-    # The API may give us a string or another type, so we try to convert it
-    # into a float. If conversion fails, we store None instead.
-    float_value = item_info.get("floatvalue")
-    if float_value is not None:
-        try:
-            float_value = float(float_value)
-        except (TypeError, ValueError):
-            float_value = None
-
-    # Same idea for paint seed: convert it to an integer if possible.
-    paint_seed = item_info.get("paintseed")
-    if paint_seed is not None:
-        try:
-            paint_seed = int(paint_seed)
-        except (TypeError, ValueError):
-            paint_seed = None
-
-    # Some items have a "stickers" list. Some do not.
-    stickers = item_info.get("stickers")
-
-    # If stickers is a list, we can count how many stickers the item has.
-    if isinstance(stickers, list):
-        has_stickers = len(stickers) > 0
-        sticker_count = len(stickers)
-    else:
-        has_stickers = None
-        sticker_count = None
-
-    # Return one dictionary holding the cleaned values.
-    return {
-        "float_value": float_value,
-        "paint_seed": paint_seed,
-        "has_stickers": has_stickers,
-        "sticker_count": sticker_count,
-    }
-
-
 def iter_listings(
     session: requests.Session,
     market_hash_name: str,
@@ -361,7 +442,6 @@ def iter_listings(
     country: str,
     language: str,
     steam_page_delay: float = DEFAULT_STEAM_PAGE_DELAY,
-    float_api_delay: float = DEFAULT_FLOAT_API_DELAY,
     steam_max_retries: int = DEFAULT_STEAM_RETRIES,
 ) -> Iterable[ListingRow]:
     """Yield listing rows one at a time.
@@ -443,32 +523,14 @@ def iter_listings(
             # Convert cents into dollars.
             price = float(price_cents) / 100.0
 
-            # Start with "unknown" values.
-            # If later steps fail, the row can still be saved.
-            float_value = None
-            paint_seed = None
-            has_stickers = None
-            sticker_count = None
-
-            if inspect_link:
-                try:
-                    # Ask the float API for extra info about this one item.
-                    metadata = fetch_float_metadata(session, inspect_link)
-
-                    # Read values back out of the metadata dictionary.
-                    float_value = metadata["float_value"]
-                    paint_seed = metadata["paint_seed"]
-                    has_stickers = metadata["has_stickers"]
-                    sticker_count = metadata["sticker_count"]
-                except Exception:
-                    # We still keep the row even if the float API fails.
-                    #
-                    # This is helpful because it means:
-                    # "a float API problem should not destroy the whole export".
-                    pass
-
-                # Slow down slightly between float API calls.
-                time.sleep(float_api_delay)
+            # Here is the big behavior change:
+            # we now try to read the extra item data directly from Steam's
+            # asset payload instead of calling a third-party float API.
+            steam_metadata = extract_steam_metadata(asset_payload)
+            float_value = steam_metadata["float_value"]
+            paint_seed = steam_metadata["paint_seed"]
+            has_stickers = steam_metadata["has_stickers"]
+            sticker_count = steam_metadata["sticker_count"]
 
             # yield sends one ListingRow back to the caller.
             # This is like saying:
@@ -583,12 +645,6 @@ def main() -> None:
         help="Seconds to wait between Steam listing page requests (default: 1.0)",
     )
     parser.add_argument(
-        "--float-api-delay",
-        type=float,
-        default=DEFAULT_FLOAT_API_DELAY,
-        help="Seconds to wait between float API requests (default: 0.3)",
-    )
-    parser.add_argument(
         "--steam-max-retries",
         type=int,
         default=DEFAULT_STEAM_RETRIES,
@@ -626,7 +682,6 @@ def main() -> None:
             country=args.country,
             language=args.language,
             steam_page_delay=args.steam_page_delay,
-            float_api_delay=args.float_api_delay,
             steam_max_retries=args.steam_max_retries,
         )
     )

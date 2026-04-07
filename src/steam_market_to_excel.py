@@ -2,8 +2,8 @@
 """Export Steam Community Market CS2 listings to an Excel file.
 
 This script crawls all listing pages (10 listings per page) for a given CS2 market
-hash name, resolves each listing's inspect link, fetches float metadata, and writes
-an Excel sheet with:
+hash name, resolves each listing's inspect link, extracts metadata directly from
+Steam's asset payload, and writes an Excel sheet with:
 - float and wear
 - paint seed
 - page number
@@ -14,6 +14,7 @@ an Excel sheet with:
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -26,8 +27,8 @@ STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
 PAGE_SIZE = 10
 DEFAULT_STEAM_PAGE_DELAY = 1.0
-DEFAULT_FLOAT_API_DELAY = 0.3
 DEFAULT_STEAM_RETRIES = 5
+PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 
 
 @dataclass
@@ -59,8 +60,80 @@ def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
     return "Battle-Scarred"
 
 
-def normalize_inspect_link(raw_link: str, listing_id: str, asset_id: str) -> str:
-    return raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+def coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_asset_property_lookup(asset_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for prop in asset_payload.get("asset_properties", []) or []:
+        property_id = coerce_int(prop.get("propertyid"))
+        if property_id is not None:
+            lookup[property_id] = prop
+    return lookup
+
+
+def normalize_inspect_link(
+    raw_link: str,
+    listing_id: str,
+    asset_id: str,
+    asset_payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    normalized = raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+    property_lookup = get_asset_property_lookup(asset_payload or {})
+
+    def replace_propid(match: re.Match[str]) -> str:
+        property_id = int(match.group(1))
+        prop = property_lookup.get(property_id, {})
+        for key in ("string_value", "int_value", "float_value"):
+            value = prop.get(key)
+            if value is not None:
+                return str(value)
+        return match.group(0)
+
+    return PROPID_PATTERN.sub(replace_propid, normalized)
+
+
+def extract_steam_metadata(asset_payload: Dict[str, Any]) -> Dict[str, Any]:
+    property_lookup = get_asset_property_lookup(asset_payload)
+
+    float_value = coerce_float(property_lookup.get(2, {}).get("float_value"))
+    paint_seed = coerce_int(property_lookup.get(1, {}).get("int_value"))
+
+    descriptions = asset_payload.get("descriptions", []) or []
+    sticker_count = sum(
+        1
+        for description in descriptions
+        if isinstance(description, dict)
+        and isinstance(description.get("value"), str)
+        and "Sticker:" in description["value"]
+    )
+    if sticker_count:
+        has_stickers: Optional[bool] = True
+    else:
+        has_stickers = None
+        sticker_count = None
+
+    return {
+        "float_value": float_value,
+        "paint_seed": paint_seed,
+        "has_stickers": has_stickers,
+        "sticker_count": sticker_count,
+    }
 
 
 def steam_render_page(
@@ -122,47 +195,14 @@ def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_i
         actions = asset_payload.get(key) or []
         for action in actions:
             link = action.get("link")
-            if isinstance(link, str) and "%assetid%" in link:
-                return normalize_inspect_link(link, listing_id=listing_id, asset_id=asset_id)
+            if isinstance(link, str) and ("csgo_econ_action_preview" in link or "%assetid%" in link):
+                return normalize_inspect_link(
+                    link,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                    asset_payload=asset_payload,
+                )
     return None
-
-
-def fetch_float_metadata(session: requests.Session, inspect_link: str) -> Dict[str, Any]:
-    # Community endpoint used by multiple CS float tools.
-    api_url = "https://api.csgofloat.com/"
-    response = session.get(api_url, params={"url": inspect_link}, timeout=25)
-    response.raise_for_status()
-    data = response.json()
-
-    item_info = data.get("iteminfo", {})
-    float_value = item_info.get("floatvalue")
-    if float_value is not None:
-        try:
-            float_value = float(float_value)
-        except (TypeError, ValueError):
-            float_value = None
-
-    paint_seed = item_info.get("paintseed")
-    if paint_seed is not None:
-        try:
-            paint_seed = int(paint_seed)
-        except (TypeError, ValueError):
-            paint_seed = None
-
-    stickers = item_info.get("stickers")
-    if isinstance(stickers, list):
-        has_stickers = len(stickers) > 0
-        sticker_count = len(stickers)
-    else:
-        has_stickers = None
-        sticker_count = None
-
-    return {
-        "float_value": float_value,
-        "paint_seed": paint_seed,
-        "has_stickers": has_stickers,
-        "sticker_count": sticker_count,
-    }
 
 
 def iter_listings(
@@ -172,7 +212,6 @@ def iter_listings(
     country: str,
     language: str,
     steam_page_delay: float = DEFAULT_STEAM_PAGE_DELAY,
-    float_api_delay: float = DEFAULT_FLOAT_API_DELAY,
     steam_max_retries: int = DEFAULT_STEAM_RETRIES,
 ) -> Iterable[ListingRow]:
     start = 0
@@ -211,24 +250,11 @@ def iter_listings(
             )
             price = float(price_cents) / 100.0
 
-            float_value = None
-            paint_seed = None
-            has_stickers = None
-            sticker_count = None
-
-            if inspect_link:
-                try:
-                    metadata = fetch_float_metadata(session, inspect_link)
-                    float_value = metadata["float_value"]
-                    paint_seed = metadata["paint_seed"]
-                    has_stickers = metadata["has_stickers"]
-                    sticker_count = metadata["sticker_count"]
-                except Exception:
-                    # Keep row even if external float service fails for this listing.
-                    pass
-
-                # Keep request pace reasonable for external API rate limits.
-                time.sleep(float_api_delay)
+            steam_metadata = extract_steam_metadata(asset_payload)
+            float_value = steam_metadata["float_value"]
+            paint_seed = steam_metadata["paint_seed"]
+            has_stickers = steam_metadata["has_stickers"]
+            sticker_count = steam_metadata["sticker_count"]
 
             yield ListingRow(
                 listing_id=listing_id,
@@ -293,12 +319,6 @@ def main() -> None:
         help="Seconds to wait between Steam listing page requests (default: 1.0)",
     )
     parser.add_argument(
-        "--float-api-delay",
-        type=float,
-        default=DEFAULT_FLOAT_API_DELAY,
-        help="Seconds to wait between float API requests (default: 0.3)",
-    )
-    parser.add_argument(
         "--steam-max-retries",
         type=int,
         default=DEFAULT_STEAM_RETRIES,
@@ -326,7 +346,6 @@ def main() -> None:
             country=args.country,
             language=args.language,
             steam_page_delay=args.steam_page_delay,
-            float_api_delay=args.float_api_delay,
             steam_max_retries=args.steam_max_retries,
         )
     )
