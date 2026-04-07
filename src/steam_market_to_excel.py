@@ -14,7 +14,6 @@ an Excel sheet with:
 from __future__ import annotations
 
 import argparse
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -29,7 +28,6 @@ PAGE_SIZE = 10
 DEFAULT_STEAM_PAGE_DELAY = 1.0
 DEFAULT_FLOAT_API_DELAY = 0.3
 DEFAULT_STEAM_RETRIES = 5
-PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 
 
 @dataclass
@@ -61,83 +59,8 @@ def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
     return "Battle-Scarred"
 
 
-def coerce_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def coerce_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def get_asset_property_lookup(asset_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
-    lookup: Dict[int, Dict[str, Any]] = {}
-    for prop in asset_payload.get("asset_properties", []) or []:
-        property_id = coerce_int(prop.get("propertyid"))
-        if property_id is not None:
-            lookup[property_id] = prop
-    return lookup
-
-
-def normalize_inspect_link(
-    raw_link: str,
-    listing_id: str,
-    asset_id: str,
-    asset_payload: Optional[Dict[str, Any]] = None,
-) -> str:
-    normalized = raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
-    property_lookup = get_asset_property_lookup(asset_payload or {})
-
-    def replace_propid(match: re.Match[str]) -> str:
-        property_id = int(match.group(1))
-        prop = property_lookup.get(property_id, {})
-        for key in ("string_value", "int_value", "float_value"):
-            value = prop.get(key)
-            if value is not None:
-                return str(value)
-        return match.group(0)
-
-    return PROPID_PATTERN.sub(replace_propid, normalized)
-
-
-def extract_steam_metadata(asset_payload: Dict[str, Any]) -> Dict[str, Any]:
-    property_lookup = get_asset_property_lookup(asset_payload)
-
-    # Valve appears to expose float in property 2 and paint seed in property 1
-    # for CS2 market asset payloads.
-    float_value = coerce_float(property_lookup.get(2, {}).get("float_value"))
-    paint_seed = coerce_int(property_lookup.get(1, {}).get("int_value"))
-
-    descriptions = asset_payload.get("descriptions", []) or []
-    sticker_count = sum(
-        1
-        for description in descriptions
-        if isinstance(description, dict)
-        and isinstance(description.get("value"), str)
-        and "Sticker:" in description["value"]
-    )
-    has_stickers: Optional[bool]
-    if sticker_count:
-        has_stickers = True
-    else:
-        has_stickers = None
-        sticker_count = None
-
-    return {
-        "float_value": float_value,
-        "paint_seed": paint_seed,
-        "has_stickers": has_stickers,
-        "sticker_count": sticker_count,
-    }
+def normalize_inspect_link(raw_link: str, listing_id: str, asset_id: str) -> str:
+    return raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
 
 
 def steam_render_page(
@@ -181,7 +104,8 @@ def steam_render_page(
 
         retry_after = response.headers.get("Retry-After")
         try:
-            wait_seconds = float(retry_after) if retry_after is not None else 0.0
+            wait_seconds = float(
+                retry_after) if retry_after is not None else 0.0
         except ValueError:
             wait_seconds = 0.0
 
@@ -198,13 +122,8 @@ def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_i
         actions = asset_payload.get(key) or []
         for action in actions:
             link = action.get("link")
-            if isinstance(link, str) and ("csgo_econ_action_preview" in link or "%assetid%" in link):
-                return normalize_inspect_link(
-                    link,
-                    listing_id=listing_id,
-                    asset_id=asset_id,
-                    asset_payload=asset_payload,
-                )
+            if isinstance(link, str) and "%assetid%" in link:
+                return normalize_inspect_link(link, listing_id=listing_id, asset_id=asset_id)
     return None
 
 
@@ -216,9 +135,19 @@ def fetch_float_metadata(session: requests.Session, inspect_link: str) -> Dict[s
     data = response.json()
 
     item_info = data.get("iteminfo", {})
-    float_value = coerce_float(item_info.get("floatvalue"))
+    float_value = item_info.get("floatvalue")
+    if float_value is not None:
+        try:
+            float_value = float(float_value)
+        except (TypeError, ValueError):
+            float_value = None
 
-    paint_seed = coerce_int(item_info.get("paintseed"))
+    paint_seed = item_info.get("paintseed")
+    if paint_seed is not None:
+        try:
+            paint_seed = int(paint_seed)
+        except (TypeError, ValueError):
+            paint_seed = None
 
     stickers = item_info.get("stickers")
     if isinstance(stickers, list):
@@ -282,21 +211,18 @@ def iter_listings(
             )
             price = float(price_cents) / 100.0
 
-            steam_metadata = extract_steam_metadata(asset_payload)
-            float_value = steam_metadata["float_value"]
-            paint_seed = steam_metadata["paint_seed"]
-            has_stickers = steam_metadata["has_stickers"]
-            sticker_count = steam_metadata["sticker_count"]
+            float_value = None
+            paint_seed = None
+            has_stickers = None
+            sticker_count = None
 
-            if inspect_link and (float_value is None or paint_seed is None):
+            if inspect_link:
                 try:
                     metadata = fetch_float_metadata(session, inspect_link)
-                    float_value = metadata["float_value"] if float_value is None else float_value
-                    paint_seed = metadata["paint_seed"] if paint_seed is None else paint_seed
-                    has_stickers = metadata["has_stickers"] if has_stickers is None else has_stickers
-                    sticker_count = (
-                        metadata["sticker_count"] if sticker_count is None else sticker_count
-                    )
+                    float_value = metadata["float_value"]
+                    paint_seed = metadata["paint_seed"]
+                    has_stickers = metadata["has_stickers"]
+                    sticker_count = metadata["sticker_count"]
                 except Exception:
                     # Keep row even if external float service fails for this listing.
                     pass
