@@ -25,3 +25,4 @@ out/
 
 #Ignore Files
 .src/*.ipynb
+.src/*steam_market_to_excel_explained.py

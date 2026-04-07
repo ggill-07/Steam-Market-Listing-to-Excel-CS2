@@ -14,6 +14,7 @@ an Excel sheet with:
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -25,6 +26,10 @@ import requests
 STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
 PAGE_SIZE = 10
+DEFAULT_STEAM_PAGE_DELAY = 1.0
+DEFAULT_FLOAT_API_DELAY = 0.3
+DEFAULT_STEAM_RETRIES = 5
+PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 
 
 @dataclass
@@ -56,8 +61,83 @@ def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
     return "Battle-Scarred"
 
 
-def normalize_inspect_link(raw_link: str, listing_id: str, asset_id: str) -> str:
-    return raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+def coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_asset_property_lookup(asset_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for prop in asset_payload.get("asset_properties", []) or []:
+        property_id = coerce_int(prop.get("propertyid"))
+        if property_id is not None:
+            lookup[property_id] = prop
+    return lookup
+
+
+def normalize_inspect_link(
+    raw_link: str,
+    listing_id: str,
+    asset_id: str,
+    asset_payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    normalized = raw_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
+    property_lookup = get_asset_property_lookup(asset_payload or {})
+
+    def replace_propid(match: re.Match[str]) -> str:
+        property_id = int(match.group(1))
+        prop = property_lookup.get(property_id, {})
+        for key in ("string_value", "int_value", "float_value"):
+            value = prop.get(key)
+            if value is not None:
+                return str(value)
+        return match.group(0)
+
+    return PROPID_PATTERN.sub(replace_propid, normalized)
+
+
+def extract_steam_metadata(asset_payload: Dict[str, Any]) -> Dict[str, Any]:
+    property_lookup = get_asset_property_lookup(asset_payload)
+
+    # Valve appears to expose float in property 2 and paint seed in property 1
+    # for CS2 market asset payloads.
+    float_value = coerce_float(property_lookup.get(2, {}).get("float_value"))
+    paint_seed = coerce_int(property_lookup.get(1, {}).get("int_value"))
+
+    descriptions = asset_payload.get("descriptions", []) or []
+    sticker_count = sum(
+        1
+        for description in descriptions
+        if isinstance(description, dict)
+        and isinstance(description.get("value"), str)
+        and "Sticker:" in description["value"]
+    )
+    has_stickers: Optional[bool]
+    if sticker_count:
+        has_stickers = True
+    else:
+        has_stickers = None
+        sticker_count = None
+
+    return {
+        "float_value": float_value,
+        "paint_seed": paint_seed,
+        "has_stickers": has_stickers,
+        "sticker_count": sticker_count,
+    }
 
 
 def steam_render_page(
@@ -67,6 +147,7 @@ def steam_render_page(
     currency: int,
     country: str,
     language: str,
+    max_retries: int = DEFAULT_STEAM_RETRIES,
 ) -> Dict[str, Any]:
     encoded_name = quote(market_hash_name, safe="")
     url = f"https://steamcommunity.com/market/listings/{STEAM_APP_ID}/{encoded_name}/render/"
@@ -78,13 +159,38 @@ def steam_render_page(
         "country": country,
         "format": "json",
     }
-    response = session.get(url, params=params, timeout=25)
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("success", False):
-        raise RuntimeError(
-            f"Steam render endpoint returned unsuccessful response for start={start}")
-    return payload
+    attempt = 0
+
+    while True:
+        response = session.get(url, params=params, timeout=25)
+        if response.status_code != 429:
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success", False):
+                raise RuntimeError(
+                    f"Steam render endpoint returned unsuccessful response for start={start}"
+                )
+            return payload
+
+        attempt += 1
+        if attempt > max_retries:
+            raise requests.HTTPError(
+                f"Steam rate limited the render endpoint after {max_retries} retries for start={start}",
+                response=response,
+            )
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            wait_seconds = float(retry_after) if retry_after is not None else 0.0
+        except ValueError:
+            wait_seconds = 0.0
+
+        wait_seconds = max(wait_seconds, min(5 * attempt, 30))
+        print(
+            f"Steam rate limited page starting at {start}. "
+            f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
+        )
+        time.sleep(wait_seconds)
 
 
 def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_id: str) -> Optional[str]:
@@ -92,8 +198,13 @@ def extract_inspect_link(asset_payload: Dict[str, Any], listing_id: str, asset_i
         actions = asset_payload.get(key) or []
         for action in actions:
             link = action.get("link")
-            if isinstance(link, str) and "%assetid%" in link:
-                return normalize_inspect_link(link, listing_id=listing_id, asset_id=asset_id)
+            if isinstance(link, str) and ("csgo_econ_action_preview" in link or "%assetid%" in link):
+                return normalize_inspect_link(
+                    link,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                    asset_payload=asset_payload,
+                )
     return None
 
 
@@ -105,19 +216,9 @@ def fetch_float_metadata(session: requests.Session, inspect_link: str) -> Dict[s
     data = response.json()
 
     item_info = data.get("iteminfo", {})
-    float_value = item_info.get("floatvalue")
-    if float_value is not None:
-        try:
-            float_value = float(float_value)
-        except (TypeError, ValueError):
-            float_value = None
+    float_value = coerce_float(item_info.get("floatvalue"))
 
-    paint_seed = item_info.get("paintseed")
-    if paint_seed is not None:
-        try:
-            paint_seed = int(paint_seed)
-        except (TypeError, ValueError):
-            paint_seed = None
+    paint_seed = coerce_int(item_info.get("paintseed"))
 
     stickers = item_info.get("stickers")
     if isinstance(stickers, list):
@@ -141,6 +242,9 @@ def iter_listings(
     currency: int,
     country: str,
     language: str,
+    steam_page_delay: float = DEFAULT_STEAM_PAGE_DELAY,
+    float_api_delay: float = DEFAULT_FLOAT_API_DELAY,
+    steam_max_retries: int = DEFAULT_STEAM_RETRIES,
 ) -> Iterable[ListingRow]:
     start = 0
     total_count: Optional[int] = None
@@ -153,6 +257,7 @@ def iter_listings(
             currency=currency,
             country=country,
             language=language,
+            max_retries=steam_max_retries,
         )
         total_count = int(payload.get("total_count", 0))
 
@@ -177,24 +282,27 @@ def iter_listings(
             )
             price = float(price_cents) / 100.0
 
-            float_value = None
-            paint_seed = None
-            has_stickers = None
-            sticker_count = None
+            steam_metadata = extract_steam_metadata(asset_payload)
+            float_value = steam_metadata["float_value"]
+            paint_seed = steam_metadata["paint_seed"]
+            has_stickers = steam_metadata["has_stickers"]
+            sticker_count = steam_metadata["sticker_count"]
 
-            if inspect_link:
+            if inspect_link and (float_value is None or paint_seed is None):
                 try:
                     metadata = fetch_float_metadata(session, inspect_link)
-                    float_value = metadata["float_value"]
-                    paint_seed = metadata["paint_seed"]
-                    has_stickers = metadata["has_stickers"]
-                    sticker_count = metadata["sticker_count"]
+                    float_value = metadata["float_value"] if float_value is None else float_value
+                    paint_seed = metadata["paint_seed"] if paint_seed is None else paint_seed
+                    has_stickers = metadata["has_stickers"] if has_stickers is None else has_stickers
+                    sticker_count = (
+                        metadata["sticker_count"] if sticker_count is None else sticker_count
+                    )
                 except Exception:
                     # Keep row even if external float service fails for this listing.
                     pass
 
                 # Keep request pace reasonable for external API rate limits.
-                time.sleep(0.2)
+                time.sleep(float_api_delay)
 
             yield ListingRow(
                 listing_id=listing_id,
@@ -212,7 +320,7 @@ def iter_listings(
 
         start += PAGE_SIZE
         # Be nice to Steam and avoid hammering listing pages.
-        time.sleep(0.35)
+        time.sleep(steam_page_delay)
 
 
 def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
@@ -252,6 +360,24 @@ def main() -> None:
                         help="Steam country code (default: US)")
     parser.add_argument("--language", default="english",
                         help="Steam language (default: english)")
+    parser.add_argument(
+        "--steam-page-delay",
+        type=float,
+        default=DEFAULT_STEAM_PAGE_DELAY,
+        help="Seconds to wait between Steam listing page requests (default: 1.0)",
+    )
+    parser.add_argument(
+        "--float-api-delay",
+        type=float,
+        default=DEFAULT_FLOAT_API_DELAY,
+        help="Seconds to wait between float API requests (default: 0.3)",
+    )
+    parser.add_argument(
+        "--steam-max-retries",
+        type=int,
+        default=DEFAULT_STEAM_RETRIES,
+        help="How many times to retry a Steam page after HTTP 429 (default: 5)",
+    )
 
     args = parser.parse_args()
 
@@ -273,6 +399,9 @@ def main() -> None:
             currency=args.currency,
             country=args.country,
             language=args.language,
+            steam_page_delay=args.steam_page_delay,
+            float_api_delay=args.float_api_delay,
+            steam_max_retries=args.steam_max_retries,
         )
     )
 
