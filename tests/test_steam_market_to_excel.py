@@ -147,6 +147,34 @@ class TestFakeApiResponses(unittest.TestCase):
         self.assertEqual(fake_session.get.call_count, 2)
         mocked_sleep.assert_called_once_with(5)
 
+    @patch("steam_market_to_excel.time.sleep")
+    def test_steam_render_page_retries_when_steam_returns_502(self, mocked_sleep):
+        bad_gateway_response = Mock(status_code=502, headers={})
+        success_response = Mock(status_code=200, headers={})
+        success_response.raise_for_status = Mock()
+        success_response.json.return_value = {
+            "success": True,
+            "total_count": 0,
+            "listinginfo": {},
+        }
+
+        fake_session = Mock()
+        fake_session.get.side_effect = [bad_gateway_response, success_response]
+
+        payload = sme.steam_render_page(
+            session=fake_session,
+            market_hash_name="AK-47 | Redline (Field-Tested)",
+            start=0,
+            currency=1,
+            country="US",
+            language="english",
+            max_retries=2,
+        )
+
+        self.assertEqual(payload["total_count"], 0)
+        self.assertEqual(fake_session.get.call_count, 2)
+        mocked_sleep.assert_called_once_with(5)
+
     def test_extract_steam_metadata_reads_asset_properties(self):
         asset_payload = {
             "asset_properties": [

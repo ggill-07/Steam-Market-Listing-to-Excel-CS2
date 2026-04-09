@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export Steam Community Market CS2 listings to an Excel file.
 
-This script crawls all listing pages (10 listings per page) for a given CS2 market
+This script crawls all listing pages (up to 100 listings per page) for a given CS2 market
 hash name, resolves each listing's inspect link, extracts metadata directly from
 Steam's asset payload, and writes an Excel sheet with:
 - float and wear
@@ -25,10 +25,11 @@ import requests
 
 STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
-PAGE_SIZE = 10
+PAGE_SIZE = 100
 DEFAULT_STEAM_PAGE_DELAY = 1.0
 DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -159,7 +160,7 @@ def steam_render_page(
 
     while True:
         response = session.get(url, params=params, timeout=25)
-        if response.status_code != 429:
+        if response.status_code not in RETRIABLE_STATUS_CODES:
             response.raise_for_status()
             payload = response.json()
             if not payload.get("success", False):
@@ -171,7 +172,7 @@ def steam_render_page(
         attempt += 1
         if attempt > max_retries:
             raise requests.HTTPError(
-                f"Steam rate limited the render endpoint after {max_retries} retries for start={start}",
+                f"Steam returned repeated temporary errors after {max_retries} retries for start={start}",
                 response=response,
             )
 
@@ -183,8 +184,9 @@ def steam_render_page(
             wait_seconds = 0.0
 
         wait_seconds = max(wait_seconds, min(5 * attempt, 30))
+        status = response.status_code
         print(
-            f"Steam rate limited page starting at {start}. "
+            f"Steam returned HTTP {status} for page starting at {start}. "
             f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
         )
         time.sleep(wait_seconds)

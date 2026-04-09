@@ -75,8 +75,9 @@ STEAM_APP_ID = 730
 # For CS2 items, context 2 is the one we want here.
 STEAM_CONTEXT_ID = 2
 
-# Steam returns 10 listings per page from the endpoint we are using.
-PAGE_SIZE = 10
+# From live testing, Steam accepted count=100 but rejected larger counts.
+# So we use 100 listings per page to reduce the total number of requests.
+PAGE_SIZE = 100
 
 # This delay helps us avoid hammering Steam too quickly.
 DEFAULT_STEAM_PAGE_DELAY = 1.0
@@ -84,6 +85,11 @@ DEFAULT_STEAM_PAGE_DELAY = 1.0
 # If Steam replies with HTTP 429 ("Too Many Requests"),
 # we will retry this many times before giving up.
 DEFAULT_STEAM_RETRIES = 5
+
+# These are HTTP status codes we consider temporary enough to retry.
+# 429 means rate limit.
+# 500/502/503/504 are common "server had a temporary problem" responses.
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Steam sometimes gives inspect links containing placeholders like %propid:6%.
 # This pattern lets us find those placeholders.
@@ -323,7 +329,7 @@ def steam_render_page(
 
     # This dictionary becomes the URL query string.
     # Example:
-    # ?start=0&count=10&currency=1...
+    # ?start=0&count=100&currency=1...
     params = {
         "start": start,
         "count": PAGE_SIZE,
@@ -342,8 +348,10 @@ def steam_render_page(
         # timeout=25 means "do not wait forever".
         response = session.get(url, params=params, timeout=25)
 
-        # A 429 status code means Steam is telling us to slow down.
-        if response.status_code != 429:
+        # If the status code is NOT in our retry list, either:
+        # - the request is fine, or
+        # - it is a hard error we should not keep retrying.
+        if response.status_code not in RETRIABLE_STATUS_CODES:
             # raise_for_status() means:
             # "If the server replied with a bad HTTP status code, stop here."
             response.raise_for_status()
@@ -363,12 +371,13 @@ def steam_render_page(
             # return ends the function immediately and sends the payload back.
             return payload
 
-        # If we reach this point, Steam gave us a 429 and we need to retry.
+        # If we reach this point, Steam gave us a temporary error
+        # and we want to retry.
         attempt += 1
 
         if attempt > max_retries:
             raise requests.HTTPError(
-                f"Steam rate limited the render endpoint after {max_retries} retries for start={start}",
+                f"Steam returned repeated temporary errors after {max_retries} retries for start={start}",
                 response=response,
             )
 
@@ -388,8 +397,9 @@ def steam_render_page(
         # wait longer on each retry, but cap the wait at 30 seconds.
         wait_seconds = max(wait_seconds, min(5 * attempt, 30))
 
+        status = response.status_code
         print(
-            f"Steam rate limited page starting at {start}. "
+            f"Steam returned HTTP {status} for page starting at {start}. "
             f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
         )
         time.sleep(wait_seconds)
@@ -492,7 +502,7 @@ def iter_listings(
         ).get(str(STEAM_CONTEXT_ID), {})
 
         # // means integer division.
-        # Example: if start is 20 and page size is 10, page_number becomes 3.
+        # Example: if start is 200 and page size is 100, page_number becomes 3.
         page_number = (start // PAGE_SIZE) + 1
 
         # .items() gives us both the key and the value from a dictionary.
@@ -554,7 +564,7 @@ def iter_listings(
             )
 
         # Move to the next page of Steam results.
-        # Because PAGE_SIZE is 10, the next page starts 10 listings later.
+        # Because PAGE_SIZE is 100, the next page starts 100 listings later.
         start += PAGE_SIZE
 
         # Slow down slightly between Steam page requests.
