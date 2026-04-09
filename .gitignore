@@ -17,6 +17,7 @@ Thumbs.db
 
 # Output files
 out/
+exports/
 *.xlsx
 *.csv
 

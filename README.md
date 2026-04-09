@@ -43,6 +43,7 @@ python -m pip install requests pandas openpyxl
 - It fetches up to `100` listings per Steam page request.
 - It reads float / paint seed / sticker-related information from Steam's asset payload when Steam includes it.
 - It retries temporary Steam errors like `429`, `500`, `502`, `503`, and `504`.
+- By default, plain output filenames are saved inside the `exports/` folder.
 - It writes the final results to an `.xlsx` file.
 
 ## Usage
@@ -59,6 +60,12 @@ Example used during testing:
 python src/steam_market_to_excel.py "MP5-SD | Neon Squeezer (Field-Tested)" -o mp5_neon_squeezer_ft.xlsx --steam-page-delay 2.0 --steam-max-retries 8
 ```
 
+With the current behavior, that example saves to:
+
+```bash
+exports/mp5_neon_squeezer_ft.xlsx
+```
+
 ## Command line options
 
 - `--currency` - Steam currency ID, default `1` for USD
@@ -66,6 +73,7 @@ python src/steam_market_to_excel.py "MP5-SD | Neon Squeezer (Field-Tested)" -o m
 - `--language` - Steam language, default `english`
 - `--steam-page-delay` - seconds to wait between Steam page requests, default `1.0`
 - `--steam-max-retries` - retry count for temporary Steam errors, default `5`
+- `-o/--output` - plain filenames go into `exports/`; custom paths are respected
 
 ## Running tests
 

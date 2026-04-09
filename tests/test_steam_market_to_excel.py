@@ -109,6 +109,14 @@ class TestBasicHelpers(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_resolve_output_path_uses_exports_folder_for_plain_filename(self):
+        result = sme.resolve_output_path("result.xlsx")
+        self.assertEqual(result, sme.DEFAULT_OUTPUT_DIR / "result.xlsx")
+
+    def test_resolve_output_path_keeps_custom_folder_paths(self):
+        result = sme.resolve_output_path("custom_folder/result.xlsx")
+        self.assertEqual(result, Path("custom_folder") / "result.xlsx")
+
 
 class TestFakeApiResponses(unittest.TestCase):
     """Tests that use fake responses instead of real HTTP requests."""

@@ -17,6 +17,7 @@ import argparse
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote
 
@@ -30,6 +31,7 @@ DEFAULT_STEAM_PAGE_DELAY = 1.0
 DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_OUTPUT_DIR = Path("exports")
 
 
 @dataclass
@@ -298,6 +300,15 @@ def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def resolve_output_path(output_name: str) -> Path:
+    output_path = Path(output_name)
+    if output_path.parent == Path("."):
+        output_path = DEFAULT_OUTPUT_DIR / output_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Scrape Steam Community Market listings for a CS2 item and export to Excel."
@@ -307,7 +318,11 @@ def main() -> None:
         help='Exact Steam market hash name, e.g. "AK-47 | Redline (Field-Tested)"',
     )
     parser.add_argument(
-        "-o", "--output", default="steam_listings.xlsx", help="Output Excel filename")
+        "-o",
+        "--output",
+        default="steam_listings.xlsx",
+        help="Output Excel filename. Plain filenames are saved inside exports/",
+    )
     parser.add_argument("--currency", type=int, default=1,
                         help="Steam currency ID (default: 1 for USD)")
     parser.add_argument("--country", default="US",
@@ -328,6 +343,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    output_path = resolve_output_path(args.output)
 
     session = requests.Session()
     session.headers.update(
@@ -353,9 +369,9 @@ def main() -> None:
     )
 
     df = rows_to_dataframe(rows)
-    df.to_excel(args.output, index=False)
+    df.to_excel(output_path, index=False)
 
-    print(f"Exported {len(df)} listings to {args.output}")
+    print(f"Exported {len(df)} listings to {output_path}")
 
 
 if __name__ == "__main__":

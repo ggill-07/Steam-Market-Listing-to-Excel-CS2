@@ -52,6 +52,9 @@ import time
 # dataclass is a decorator used to make simple classes for storing data.
 from dataclasses import dataclass
 
+# Path helps us work with file and folder paths in a cleaner way.
+from pathlib import Path
+
 # These imports are all type hints.
 # Type hints help describe what kind of data a function expects or returns.
 from typing import Any, Dict, Iterable, List, Optional
@@ -90,6 +93,9 @@ DEFAULT_STEAM_RETRIES = 5
 # 429 means rate limit.
 # 500/502/503/504 are common "server had a temporary problem" responses.
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# This is the default folder where Excel exports will be saved.
+DEFAULT_OUTPUT_DIR = Path("exports")
 
 # Steam sometimes gives inspect links containing placeholders like %propid:6%.
 # This pattern lets us find those placeholders.
@@ -605,6 +611,29 @@ def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def resolve_output_path(output_name: str) -> Path:
+    """Choose the final Excel path and create its folder if needed.
+
+    Current behavior:
+    - "result.xlsx" becomes "exports/result.xlsx"
+    - "my_folder/result.xlsx" stays exactly that
+
+    This keeps the repo cleaner because exported spreadsheets no longer pile up
+    in the project root by default.
+    """
+
+    # Turn plain text into a Path object so Python can reason about the path.
+    output_path = Path(output_name)
+
+    # If the user only gave a plain filename, place it inside the exports folder.
+    if output_path.parent == Path("."):
+        output_path = DEFAULT_OUTPUT_DIR / output_path
+
+    # Create the folder if it does not already exist.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
 def main() -> None:
     """Parse command-line arguments, run the scrape, and save the Excel file.
 
@@ -630,7 +659,7 @@ def main() -> None:
         "-o",
         "--output",
         default="steam_listings.xlsx",
-        help="Output Excel filename",
+        help="Output Excel filename. Plain filenames are saved inside exports/",
     )
     parser.add_argument(
         "--currency",
@@ -663,6 +692,10 @@ def main() -> None:
 
     # parse_args() reads the command you typed in the terminal.
     args = parser.parse_args()
+
+    # Decide where the Excel file should really be saved.
+    # If you type only a filename, the program now saves it into exports/.
+    output_path = resolve_output_path(args.output)
 
     # requests.Session() creates a reusable HTTP session object.
     # Using one session is cleaner than setting everything up from scratch
@@ -701,9 +734,10 @@ def main() -> None:
 
     # Save that table as an Excel file.
     # index=False means "do not write pandas row numbers as a separate column".
-    df.to_excel(args.output, index=False)
+    df.to_excel(output_path, index=False)
 
-    print(f"Exported {len(df)} listings to {args.output}")
+    # Show the final save location so the user knows exactly where to look.
+    print(f"Exported {len(df)} listings to {output_path}")
 
 
 # This special check means:
