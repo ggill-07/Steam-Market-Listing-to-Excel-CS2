@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_OUTPUT_DIR = Path("exports")
+CLI_COMMANDS = {"fetch"}
 
 
 @dataclass
@@ -309,10 +311,7 @@ def resolve_output_path(output_name: str) -> Path:
     return output_path
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Scrape Steam Community Market listings for a CS2 item and export to Excel."
-    )
+def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "market_hash_name",
         help='Exact Steam market hash name, e.g. "AK-47 | Redline (Field-Tested)"',
@@ -342,7 +341,43 @@ def main() -> None:
         help="How many times to retry a Steam page after HTTP 429 (default: 5)",
     )
 
-    args = parser.parse_args()
+
+def build_legacy_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Scrape Steam Community Market listings for a CS2 item and export to Excel."
+    )
+    add_fetch_arguments(parser)
+    parser.set_defaults(command="fetch")
+    return parser
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Steam Market Listing to Excel CLI."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Scrape Steam Community Market listings and export to Excel.",
+        description="Scrape Steam Community Market listings for a CS2 item and export to Excel.",
+    )
+    add_fetch_arguments(fetch_parser)
+
+    return parser
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if argv and argv[0] in CLI_COMMANDS:
+        return build_cli_parser().parse_args(argv)
+
+    return build_legacy_parser().parse_args(argv)
+
+
+def run_fetch(args: argparse.Namespace) -> None:
     output_path = resolve_output_path(args.output)
 
     session = requests.Session()
@@ -372,6 +407,12 @@ def main() -> None:
     df.to_excel(output_path, index=False)
 
     print(f"Exported {len(df)} listings to {output_path}")
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    if args.command == "fetch":
+        run_fetch(args)
 
 
 if __name__ == "__main__":

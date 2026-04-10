@@ -117,6 +117,22 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
         self.assertEqual(result, Path("custom_folder") / "result.xlsx")
 
+    def test_parse_args_supports_legacy_fetch_style(self):
+        args = sme.parse_args(["AK-47 | Redline (Field-Tested)"])
+
+        self.assertEqual(args.command, "fetch")
+        self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
+        self.assertEqual(args.output, "steam_listings.xlsx")
+
+    def test_parse_args_supports_fetch_subcommand(self):
+        args = sme.parse_args(
+            ["fetch", "AK-47 | Redline (Field-Tested)", "-o", "custom.xlsx"]
+        )
+
+        self.assertEqual(args.command, "fetch")
+        self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
+        self.assertEqual(args.output, "custom.xlsx")
+
 
 class TestFakeApiResponses(unittest.TestCase):
     """Tests that use fake responses instead of real HTTP requests."""
@@ -317,6 +333,24 @@ class TestListingAndExportFlow(unittest.TestCase):
         )
         self.assertEqual(dataframe.iloc[0]["listing_id"], "listing-1")
         self.assertEqual(dataframe.iloc[0]["float"], 0.12)
+
+    @patch("steam_market_to_excel.run_fetch")
+    def test_main_uses_legacy_style_as_fetch_command(self, mocked_run_fetch):
+        sme.main(["AK-47 | Redline (Field-Tested)"])
+
+        mocked_run_fetch.assert_called_once()
+        args = mocked_run_fetch.call_args.args[0]
+        self.assertEqual(args.command, "fetch")
+        self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
+
+    @patch("steam_market_to_excel.run_fetch")
+    def test_main_uses_fetch_subcommand(self, mocked_run_fetch):
+        sme.main(["fetch", "AK-47 | Redline (Field-Tested)"])
+
+        mocked_run_fetch.assert_called_once()
+        args = mocked_run_fetch.call_args.args[0]
+        self.assertEqual(args.command, "fetch")
+        self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
 
 
 if __name__ == "__main__":
