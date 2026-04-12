@@ -1,4 +1,4 @@
-# Steam Market Listing to Excel (CS2)
+# Steam Market Listing to CLI Tool (CS2)
 
 A command-line tool for scraping CS2 Steam Community Market listings, saving them to Excel or CSV, and then exploring the saved data from the terminal.
 
