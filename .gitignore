@@ -24,6 +24,12 @@ tmp*/
 *.xlsx
 *.csv
 
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+*.spec
+
 # Secrets / local config
 .env
 

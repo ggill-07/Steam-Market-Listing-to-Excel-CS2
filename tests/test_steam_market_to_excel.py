@@ -15,6 +15,7 @@ import argparse
 import io
 import shutil
 import sys
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -199,6 +200,34 @@ class TestBasicHelpers(unittest.TestCase):
 
         self.assertEqual(args.command, "show")
         self.assertEqual(args.input_path, "latest")
+
+    def test_pyproject_declares_installable_smte_command(self):
+        pyproject_path = PROJECT_ROOT / "pyproject.toml"
+        with pyproject_path.open("rb") as handle:
+            pyproject_data = tomllib.load(handle)
+
+        self.assertEqual(
+            pyproject_data["project"]["scripts"]["smte"],
+            "steam_market_to_excel:main",
+        )
+        self.assertEqual(
+            pyproject_data["tool"]["setuptools"]["py-modules"],
+            ["steam_market_to_excel"],
+        )
+
+    def test_windows_exe_build_script_exists_and_targets_main_script(self):
+        build_script_path = PROJECT_ROOT / "scripts" / "build_windows_exe.ps1"
+        script_text = build_script_path.read_text(encoding="utf-8")
+
+        self.assertIn("python -m PyInstaller", script_text)
+        self.assertIn("--onefile", script_text)
+        self.assertIn("--specpath $buildDir", script_text)
+        self.assertIn("Remove-Item -LiteralPath $exePath -Force", script_text)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", script_text)
+        self.assertIn("for ($attempt = 1; $attempt -le 10; $attempt++)", script_text)
+        self.assertIn("Start-Sleep -Milliseconds (200 * $attempt)", script_text)
+        self.assertIn("src\\steam_market_to_excel.py", script_text)
+        self.assertIn('$distDir = Join-Path $repoRoot "dist"', script_text)
 
 
 class TestFakeApiResponses(unittest.TestCase):

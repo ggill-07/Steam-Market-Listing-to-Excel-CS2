@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steam-market-listing-to-excel-cs2"
+version = "1.0.0"
+description = "CLI tool for scraping and exploring CS2 Steam Community Market listings."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "pandas",
+    "openpyxl",
+]
+
+[project.scripts]
+smte = "steam_market_to_excel:main"
+
+[tool.setuptools]
+py-modules = ["steam_market_to_excel"]
+
+[tool.setuptools.package-dir]
+"" = "src"
