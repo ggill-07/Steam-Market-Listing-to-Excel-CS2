@@ -33,7 +33,16 @@ DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_OUTPUT_DIR = Path("exports")
-CLI_COMMANDS = {"fetch"}
+CLI_COMMANDS = {"fetch", "sort", "filter", "stats", "show"}
+DEFAULT_SHOW_COLUMNS = [
+    "page",
+    "float",
+    "price",
+    "stickers",
+    "wear",
+    "paint_seed",
+    "listing_id",
+]
 
 
 @dataclass
@@ -311,6 +320,188 @@ def resolve_output_path(output_name: str) -> Path:
     return output_path
 
 
+def derive_output_path(input_name: str, suffix: str) -> Path:
+    input_path = Path(input_name)
+    extension = input_path.suffix or ".xlsx"
+    derived_name = f"{input_path.stem}_{suffix}{extension}"
+    return input_path.with_name(derived_name)
+
+
+def resolve_input_path(input_name: str) -> Path:
+    if input_name.lower() == "latest":
+        candidate_paths = [
+            path
+            for path in DEFAULT_OUTPUT_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in {".csv", ".xlsx", ".xls"}
+        ]
+        if not candidate_paths:
+            raise FileNotFoundError("No export files were found in exports/")
+        return max(candidate_paths, key=lambda path: path.stat().st_mtime)
+
+    return Path(input_name)
+
+
+def load_table(input_name: str) -> pd.DataFrame:
+    input_path = resolve_input_path(input_name)
+    suffix = input_path.suffix.lower()
+
+    if suffix == ".csv":
+        return pd.read_csv(input_path)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(input_path)
+
+    raise ValueError("Input file must be a .csv, .xlsx, or .xls file")
+
+
+def save_table(dataframe: pd.DataFrame, output_name: str) -> Path:
+    output_path = resolve_output_path(output_name)
+    suffix = output_path.suffix.lower()
+
+    if suffix == ".csv":
+        dataframe.to_csv(output_path, index=False)
+        return output_path
+    if suffix in {".xlsx", ".xls"}:
+        dataframe.to_excel(output_path, index=False)
+        return output_path
+
+    raise ValueError("Output file must end in .csv, .xlsx, or .xls")
+
+
+def ensure_columns_exist(dataframe: pd.DataFrame, column_names: List[str]) -> None:
+    missing_columns = [column for column in column_names if column not in dataframe.columns]
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise ValueError(f"Missing required columns: {missing_text}")
+
+
+def filter_dataframe(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    filtered = dataframe.copy()
+
+    if args.min_float is not None or args.max_float is not None:
+        ensure_columns_exist(filtered, ["float"])
+        float_series = pd.to_numeric(filtered["float"], errors="coerce")
+        if args.min_float is not None:
+            filtered = filtered[float_series >= args.min_float]
+            float_series = pd.to_numeric(filtered["float"], errors="coerce")
+        if args.max_float is not None:
+            filtered = filtered[float_series <= args.max_float]
+
+    if args.min_price is not None or args.max_price is not None:
+        ensure_columns_exist(filtered, ["price"])
+        price_series = pd.to_numeric(filtered["price"], errors="coerce")
+        if args.min_price is not None:
+            filtered = filtered[price_series >= args.min_price]
+            price_series = pd.to_numeric(filtered["price"], errors="coerce")
+        if args.max_price is not None:
+            filtered = filtered[price_series <= args.max_price]
+
+    if args.wear is not None:
+        ensure_columns_exist(filtered, ["wear"])
+        filtered = filtered[filtered["wear"] == args.wear]
+
+    if args.paint_seed is not None:
+        ensure_columns_exist(filtered, ["paint_seed"])
+        paint_seed_series = pd.to_numeric(filtered["paint_seed"], errors="coerce")
+        filtered = filtered[paint_seed_series == args.paint_seed]
+
+    if args.has_stickers:
+        ensure_columns_exist(filtered, ["has_stickers"])
+        sticker_series = filtered["has_stickers"].fillna(False).astype(bool)
+        filtered = filtered[sticker_series]
+
+    if args.no_stickers:
+        ensure_columns_exist(filtered, ["has_stickers"])
+        sticker_series = filtered["has_stickers"].fillna(False).astype(bool)
+        filtered = filtered[~sticker_series]
+
+    if args.min_sticker_count is not None or args.max_sticker_count is not None:
+        ensure_columns_exist(filtered, ["sticker_count"])
+        sticker_count_series = pd.to_numeric(filtered["sticker_count"], errors="coerce").fillna(0)
+        if args.min_sticker_count is not None:
+            filtered = filtered[sticker_count_series >= args.min_sticker_count]
+            sticker_count_series = pd.to_numeric(filtered["sticker_count"], errors="coerce").fillna(0)
+        if args.max_sticker_count is not None:
+            filtered = filtered[sticker_count_series <= args.max_sticker_count]
+
+    return filtered
+
+
+def build_stats_lines(dataframe: pd.DataFrame, input_name: str) -> List[str]:
+    lines = [f"Stats for {input_name}", f"rows: {len(dataframe)}"]
+
+    if "price" in dataframe.columns:
+        price_series = pd.to_numeric(dataframe["price"], errors="coerce").dropna()
+        if not price_series.empty:
+            lines.append(f"price_min: {price_series.min():.2f}")
+            lines.append(f"price_max: {price_series.max():.2f}")
+            lines.append(f"price_avg: {price_series.mean():.2f}")
+
+    if "float" in dataframe.columns:
+        float_series = pd.to_numeric(dataframe["float"], errors="coerce").dropna()
+        if not float_series.empty:
+            lines.append(f"float_min: {float_series.min():.6f}")
+            lines.append(f"float_max: {float_series.max():.6f}")
+            lines.append(f"float_avg: {float_series.mean():.6f}")
+
+    if "wear" in dataframe.columns:
+        wear_counts = dataframe["wear"].fillna("Unknown").value_counts()
+        for wear_name, count in wear_counts.items():
+            lines.append(f"wear_{wear_name}: {count}")
+
+    if "sticker_count" in dataframe.columns:
+        sticker_count_series = pd.to_numeric(dataframe["sticker_count"], errors="coerce").fillna(0)
+        lines.append(f"total_stickers: {int(sticker_count_series.sum())}")
+
+    return lines
+
+
+def sort_dataframe(dataframe: pd.DataFrame, sort_by: List[str], descending: bool) -> pd.DataFrame:
+    ensure_columns_exist(dataframe, sort_by)
+    return dataframe.sort_values(
+        by=sort_by,
+        ascending=not descending,
+        kind="stable",
+    )
+
+
+def build_show_dataframe(
+    dataframe: pd.DataFrame,
+    columns: Optional[List[str]] = None,
+    limit: Optional[int] = None,
+) -> pd.DataFrame:
+    display_dataframe = dataframe.copy()
+
+    if "has_stickers" in display_dataframe.columns and "stickers" not in display_dataframe.columns:
+        display_dataframe["stickers"] = display_dataframe["has_stickers"].map(
+            lambda value: "yes" if value else "no"
+        )
+
+    if columns is None:
+        columns = DEFAULT_SHOW_COLUMNS
+
+    available_columns = [column for column in columns if column in display_dataframe.columns]
+    if not available_columns:
+        raise ValueError("None of the requested display columns exist in the file")
+
+    display_dataframe = display_dataframe[available_columns]
+
+    if "float" in display_dataframe.columns:
+        display_dataframe["float"] = pd.to_numeric(display_dataframe["float"], errors="coerce").map(
+            lambda value: "" if pd.isna(value) else f"{value:.6f}"
+        )
+    if "price" in display_dataframe.columns:
+        display_dataframe["price"] = pd.to_numeric(display_dataframe["price"], errors="coerce").map(
+            lambda value: "" if pd.isna(value) else f"{value:.2f}"
+        )
+
+    display_dataframe = display_dataframe.fillna("")
+
+    if limit is not None:
+        display_dataframe = display_dataframe.head(limit)
+
+    return display_dataframe
+
+
 def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "market_hash_name",
@@ -342,6 +533,137 @@ def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_input_path_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "input_path",
+        help="Path to an existing .xlsx, .xls, or .csv file created by this tool, or use latest",
+    )
+
+
+def add_sort_arguments(parser: argparse.ArgumentParser) -> None:
+    add_input_path_argument(parser)
+    parser.add_argument(
+        "--by",
+        nargs="+",
+        required=True,
+        help="One or more column names to sort by, e.g. --by float price",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        help="Sort in descending order instead of ascending order",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output file path. Default is based on the input file name.",
+    )
+
+
+def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    add_input_path_argument(parser)
+    parser.add_argument("--min-float", type=float, default=None, help="Keep rows with float >= this value")
+    parser.add_argument("--max-float", type=float, default=None, help="Keep rows with float <= this value")
+    parser.add_argument("--min-price", type=float, default=None, help="Keep rows with price >= this value")
+    parser.add_argument("--max-price", type=float, default=None, help="Keep rows with price <= this value")
+    parser.add_argument("--wear", default=None, help="Keep only rows with this wear value")
+    parser.add_argument("--paint-seed", type=int, default=None, help="Keep only rows with this paint seed")
+
+    sticker_group = parser.add_mutually_exclusive_group()
+    sticker_group.add_argument(
+        "--has-stickers",
+        action="store_true",
+        help="Keep only rows that have stickers",
+    )
+    sticker_group.add_argument(
+        "--no-stickers",
+        action="store_true",
+        help="Keep only rows that do not have stickers",
+    )
+
+    parser.add_argument(
+        "--min-sticker-count",
+        type=int,
+        default=None,
+        help="Keep rows with sticker_count >= this value",
+    )
+    parser.add_argument(
+        "--max-sticker-count",
+        type=int,
+        default=None,
+        help="Keep rows with sticker_count <= this value",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output file path. Default is based on the input file name.",
+    )
+
+
+def add_show_arguments(parser: argparse.ArgumentParser) -> None:
+    add_input_path_argument(parser)
+    parser.add_argument("--min-float", type=float, default=None, help="Show rows with float >= this value")
+    parser.add_argument("--max-float", type=float, default=None, help="Show rows with float <= this value")
+    parser.add_argument("--min-price", type=float, default=None, help="Show rows with price >= this value")
+    parser.add_argument("--max-price", type=float, default=None, help="Show rows with price <= this value")
+    parser.add_argument("--wear", default=None, help="Show only rows with this wear value")
+    parser.add_argument("--paint-seed", type=int, default=None, help="Show only rows with this paint seed")
+
+    sticker_group = parser.add_mutually_exclusive_group()
+    sticker_group.add_argument(
+        "--has-stickers",
+        action="store_true",
+        help="Show only rows that have stickers",
+    )
+    sticker_group.add_argument(
+        "--no-stickers",
+        action="store_true",
+        help="Show only rows that do not have stickers",
+    )
+
+    parser.add_argument(
+        "--min-sticker-count",
+        type=int,
+        default=None,
+        help="Show rows with sticker_count >= this value",
+    )
+    parser.add_argument(
+        "--max-sticker-count",
+        type=int,
+        default=None,
+        help="Show rows with sticker_count <= this value",
+    )
+    parser.add_argument(
+        "--sort-by",
+        nargs="+",
+        default=None,
+        help="One or more column names to sort by before showing rows",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        help="Show rows in descending sort order",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Maximum number of rows to show in the terminal (default: 25)",
+    )
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        default=None,
+        help="Column names to show in the terminal output",
+    )
+
+
+def add_stats_arguments(parser: argparse.ArgumentParser) -> None:
+    add_input_path_argument(parser)
+
+
 def build_legacy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scrape Steam Community Market listings for a CS2 item and export to Excel."
@@ -353,7 +675,10 @@ def build_legacy_parser() -> argparse.ArgumentParser:
 
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Steam Market Listing to Excel CLI."
+        description=(
+            "Steam Market Listing to Excel CLI. "
+            "Legacy fetch style still works if you pass the market name directly."
+        )
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -364,6 +689,34 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     add_fetch_arguments(fetch_parser)
 
+    sort_parser = subparsers.add_parser(
+        "sort",
+        help="Sort an existing export file and write a new file.",
+        description="Sort an existing export file and write a new file.",
+    )
+    add_sort_arguments(sort_parser)
+
+    filter_parser = subparsers.add_parser(
+        "filter",
+        help="Filter an existing export file and write a new file.",
+        description="Filter an existing export file and write a new file.",
+    )
+    add_filter_arguments(filter_parser)
+
+    show_parser = subparsers.add_parser(
+        "show",
+        help="Show matching rows from an existing export file in the terminal.",
+        description="Show matching rows from an existing export file in the terminal.",
+    )
+    add_show_arguments(show_parser)
+
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Print a quick summary of an existing export file.",
+        description="Print a quick summary of an existing export file.",
+    )
+    add_stats_arguments(stats_parser)
+
     return parser
 
 
@@ -371,15 +724,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if argv is None:
         argv = sys.argv[1:]
 
-    if argv and argv[0] in CLI_COMMANDS:
+    if argv and (argv[0] in CLI_COMMANDS or argv[0] in {"-h", "--help"}):
         return build_cli_parser().parse_args(argv)
 
     return build_legacy_parser().parse_args(argv)
 
 
 def run_fetch(args: argparse.Namespace) -> None:
-    output_path = resolve_output_path(args.output)
-
     session = requests.Session()
     session.headers.update(
         {
@@ -404,15 +755,72 @@ def run_fetch(args: argparse.Namespace) -> None:
     )
 
     df = rows_to_dataframe(rows)
-    df.to_excel(output_path, index=False)
+    output_path = save_table(df, args.output)
 
     print(f"Exported {len(df)} listings to {output_path}")
+
+
+def run_sort(args: argparse.Namespace) -> None:
+    resolved_input_path = resolve_input_path(args.input_path)
+    dataframe = load_table(str(resolved_input_path))
+    sorted_dataframe = sort_dataframe(dataframe, args.by, args.descending)
+    output_name = args.output or str(derive_output_path(str(resolved_input_path), "sorted"))
+    output_path = save_table(sorted_dataframe, output_name)
+
+    print(f"Sorted {len(sorted_dataframe)} rows into {output_path}")
+
+
+def run_filter(args: argparse.Namespace) -> None:
+    resolved_input_path = resolve_input_path(args.input_path)
+    dataframe = load_table(str(resolved_input_path))
+    filtered_dataframe = filter_dataframe(dataframe, args)
+
+    output_name = args.output or str(derive_output_path(str(resolved_input_path), "filtered"))
+    output_path = save_table(filtered_dataframe, output_name)
+
+    print(f"Filtered {len(filtered_dataframe)} rows into {output_path}")
+
+
+def run_stats(args: argparse.Namespace) -> None:
+    resolved_input_path = resolve_input_path(args.input_path)
+    dataframe = load_table(str(resolved_input_path))
+    for line in build_stats_lines(dataframe, str(resolved_input_path)):
+        print(line)
+
+
+def run_show(args: argparse.Namespace) -> None:
+    resolved_input_path = resolve_input_path(args.input_path)
+    dataframe = load_table(str(resolved_input_path))
+    filtered_dataframe = filter_dataframe(dataframe, args)
+
+    if args.sort_by:
+        filtered_dataframe = sort_dataframe(filtered_dataframe, args.sort_by, args.descending)
+
+    display_dataframe = build_show_dataframe(
+        filtered_dataframe,
+        columns=args.columns,
+        limit=args.limit,
+    )
+
+    print(f"Showing {len(display_dataframe)} of {len(filtered_dataframe)} matching rows from {resolved_input_path}")
+    if display_dataframe.empty:
+        return
+
+    print(display_dataframe.to_string(index=False))
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     if args.command == "fetch":
         run_fetch(args)
+    elif args.command == "sort":
+        run_sort(args)
+    elif args.command == "filter":
+        run_filter(args)
+    elif args.command == "show":
+        run_show(args)
+    elif args.command == "stats":
+        run_stats(args)
 
 
 if __name__ == "__main__":

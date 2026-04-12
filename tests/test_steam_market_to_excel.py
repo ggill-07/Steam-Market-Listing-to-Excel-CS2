@@ -11,10 +11,16 @@ You can run these tests with:
     python -B -m unittest discover -s tests -v
 """
 
+import argparse
+import io
+import shutil
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pandas as pd
 
 
 # Make sure Python can import the file from the src/ folder.
@@ -24,6 +30,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import steam_market_to_excel as sme
+
+
+def make_workspace_temp_dir(name: str) -> Path:
+    temp_dir = PROJECT_ROOT / "tests" / "_tmp_runtime" / name
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
 
 
 class TestBasicHelpers(unittest.TestCase):
@@ -117,6 +131,25 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
         self.assertEqual(result, Path("custom_folder") / "result.xlsx")
 
+    def test_resolve_input_path_supports_latest_keyword(self):
+        temp_dir = make_workspace_temp_dir("resolve_latest")
+        older_file = temp_dir / "older.xlsx"
+        newer_file = temp_dir / "newer.xlsx"
+        older_file.write_text("older", encoding="utf-8")
+        newer_file.write_text("newer", encoding="utf-8")
+        older_timestamp = 1_700_000_000
+        newer_timestamp = older_timestamp + 10
+        older_file.touch()
+        newer_file.touch()
+        import os
+        os.utime(older_file, (older_timestamp, older_timestamp))
+        os.utime(newer_file, (newer_timestamp, newer_timestamp))
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            result = sme.resolve_input_path("latest")
+
+        self.assertEqual(result, newer_file)
+
     def test_parse_args_supports_legacy_fetch_style(self):
         args = sme.parse_args(["AK-47 | Redline (Field-Tested)"])
 
@@ -132,6 +165,40 @@ class TestBasicHelpers(unittest.TestCase):
         self.assertEqual(args.command, "fetch")
         self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
         self.assertEqual(args.output, "custom.xlsx")
+
+    def test_parse_args_supports_sort_subcommand(self):
+        args = sme.parse_args(["sort", "exports/sample.xlsx", "--by", "float", "price"])
+
+        self.assertEqual(args.command, "sort")
+        self.assertEqual(args.input_path, "exports/sample.xlsx")
+        self.assertEqual(args.by, ["float", "price"])
+
+    def test_parse_args_supports_filter_subcommand(self):
+        args = sme.parse_args(["filter", "exports/sample.xlsx", "--max-float", "0.15"])
+
+        self.assertEqual(args.command, "filter")
+        self.assertEqual(args.input_path, "exports/sample.xlsx")
+        self.assertEqual(args.max_float, 0.15)
+
+    def test_parse_args_supports_stats_subcommand(self):
+        args = sme.parse_args(["stats", "exports/sample.xlsx"])
+
+        self.assertEqual(args.command, "stats")
+        self.assertEqual(args.input_path, "exports/sample.xlsx")
+
+    def test_parse_args_supports_show_subcommand(self):
+        args = sme.parse_args(["show", "exports/sample.xlsx", "--max-float", "0.10", "--sort-by", "float"])
+
+        self.assertEqual(args.command, "show")
+        self.assertEqual(args.input_path, "exports/sample.xlsx")
+        self.assertEqual(args.max_float, 0.10)
+        self.assertEqual(args.sort_by, ["float"])
+
+    def test_parse_args_supports_latest_as_input_path(self):
+        args = sme.parse_args(["show", "latest", "--max-float", "0.10"])
+
+        self.assertEqual(args.command, "show")
+        self.assertEqual(args.input_path, "latest")
 
 
 class TestFakeApiResponses(unittest.TestCase):
@@ -334,6 +401,214 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertEqual(dataframe.iloc[0]["listing_id"], "listing-1")
         self.assertEqual(dataframe.iloc[0]["float"], 0.12)
 
+    def test_save_table_and_load_table_support_csv(self):
+        dataframe = sme.rows_to_dataframe(
+            [
+                sme.ListingRow(
+                    listing_id="listing-1",
+                    asset_id="asset-1",
+                    page=1,
+                    price=1.5,
+                    currency="1",
+                    float_value=0.12,
+                    wear="Minimal Wear",
+                    paint_seed=7,
+                    has_stickers=True,
+                    sticker_count=1,
+                    inspect_link="steam://inspect",
+                )
+            ]
+        )
+
+        temp_dir = make_workspace_temp_dir("save_load_csv")
+        output_path = temp_dir / "sample.csv"
+        saved_path = sme.save_table(dataframe, str(output_path))
+        loaded_dataframe = sme.load_table(str(saved_path))
+
+        self.assertEqual(saved_path, output_path)
+        self.assertEqual(len(loaded_dataframe), 1)
+        self.assertEqual(loaded_dataframe.iloc[0]["listing_id"], "listing-1")
+
+    def test_filter_dataframe_applies_requested_rules(self):
+        dataframe = pd.DataFrame(
+            [
+                {"float": 0.05, "price": 2.0, "wear": "Factory New", "paint_seed": 10, "has_stickers": True, "sticker_count": 2},
+                {"float": 0.20, "price": 1.0, "wear": "Field-Tested", "paint_seed": 11, "has_stickers": None, "sticker_count": None},
+            ]
+        )
+        args = argparse.Namespace(
+            min_float=0.04,
+            max_float=0.10,
+            min_price=1.5,
+            max_price=2.5,
+            wear="Factory New",
+            paint_seed=10,
+            has_stickers=True,
+            no_stickers=False,
+            min_sticker_count=1,
+            max_sticker_count=3,
+        )
+
+        filtered_dataframe = sme.filter_dataframe(dataframe, args)
+
+        self.assertEqual(len(filtered_dataframe), 1)
+        self.assertEqual(filtered_dataframe.iloc[0]["paint_seed"], 10)
+
+    def test_build_stats_lines_returns_summary_text(self):
+        dataframe = pd.DataFrame(
+            [
+                {"price": 1.0, "float": 0.10, "wear": "Minimal Wear", "sticker_count": 1},
+                {"price": 3.0, "float": 0.20, "wear": "Field-Tested", "sticker_count": 0},
+            ]
+        )
+
+        lines = sme.build_stats_lines(dataframe, "exports/sample.xlsx")
+
+        self.assertIn("Stats for exports/sample.xlsx", lines[0])
+        self.assertIn("rows: 2", lines)
+        self.assertIn("price_min: 1.00", lines)
+        self.assertIn("price_max: 3.00", lines)
+
+    def test_build_show_dataframe_formats_terminal_output_columns(self):
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "page": 1,
+                    "float": 0.1234567,
+                    "price": 2,
+                    "has_stickers": True,
+                    "wear": "Minimal Wear",
+                    "paint_seed": 7,
+                    "listing_id": "listing-1",
+                }
+            ]
+        )
+
+        display_dataframe = sme.build_show_dataframe(dataframe)
+
+        self.assertEqual(
+            list(display_dataframe.columns),
+            ["page", "float", "price", "stickers", "wear", "paint_seed", "listing_id"],
+        )
+        self.assertEqual(display_dataframe.iloc[0]["float"], "0.123457")
+        self.assertEqual(display_dataframe.iloc[0]["price"], "2.00")
+        self.assertEqual(display_dataframe.iloc[0]["stickers"], "yes")
+
+    def test_run_sort_creates_sorted_output_file(self):
+        dataframe = pd.DataFrame(
+            [
+                {"listing_id": "b", "float": 0.20, "price": 2.0},
+                {"listing_id": "a", "float": 0.10, "price": 1.0},
+            ]
+        )
+
+        temp_dir = make_workspace_temp_dir("run_sort")
+        input_path = temp_dir / "sample.csv"
+        dataframe.to_csv(input_path, index=False)
+        args = argparse.Namespace(
+            input_path=str(input_path),
+            by=["float"],
+            descending=False,
+            output=None,
+        )
+
+        sme.run_sort(args)
+        output_path = input_path.with_name("sample_sorted.csv")
+        sorted_dataframe = pd.read_csv(output_path)
+
+        self.assertEqual(list(sorted_dataframe["listing_id"]), ["a", "b"])
+
+    def test_run_filter_creates_filtered_output_file(self):
+        dataframe = pd.DataFrame(
+            [
+                {"listing_id": "keep", "float": 0.05, "price": 2.0, "wear": "Factory New", "paint_seed": 1, "has_stickers": True, "sticker_count": 1},
+                {"listing_id": "drop", "float": 0.40, "price": 0.5, "wear": "Well-Worn", "paint_seed": 2, "has_stickers": None, "sticker_count": None},
+            ]
+        )
+
+        temp_dir = make_workspace_temp_dir("run_filter")
+        input_path = temp_dir / "sample.csv"
+        dataframe.to_csv(input_path, index=False)
+        args = argparse.Namespace(
+            input_path=str(input_path),
+            min_float=None,
+            max_float=0.10,
+            min_price=None,
+            max_price=None,
+            wear=None,
+            paint_seed=None,
+            has_stickers=False,
+            no_stickers=False,
+            min_sticker_count=None,
+            max_sticker_count=None,
+            output=None,
+        )
+
+        sme.run_filter(args)
+        output_path = input_path.with_name("sample_filtered.csv")
+        filtered_dataframe = pd.read_csv(output_path)
+
+        self.assertEqual(list(filtered_dataframe["listing_id"]), ["keep"])
+
+    def test_run_stats_prints_summary(self):
+        dataframe = pd.DataFrame(
+            [
+                {"price": 1.0, "float": 0.10, "wear": "Minimal Wear", "sticker_count": 1},
+                {"price": 3.0, "float": 0.20, "wear": "Field-Tested", "sticker_count": 0},
+            ]
+        )
+
+        temp_dir = make_workspace_temp_dir("run_stats")
+        input_path = temp_dir / "sample.csv"
+        dataframe.to_csv(input_path, index=False)
+        args = argparse.Namespace(input_path=str(input_path))
+        buffer = io.StringIO()
+
+        with redirect_stdout(buffer):
+            sme.run_stats(args)
+
+        output_text = buffer.getvalue()
+        self.assertIn("Stats for", output_text)
+        self.assertIn("rows: 2", output_text)
+
+    def test_run_show_prints_matching_rows(self):
+        dataframe = pd.DataFrame(
+            [
+                {"page": 1, "float": 0.05, "price": 2.0, "wear": "Factory New", "paint_seed": 1, "has_stickers": True, "sticker_count": 1, "listing_id": "keep"},
+                {"page": 2, "float": 0.20, "price": 3.0, "wear": "Field-Tested", "paint_seed": 2, "has_stickers": None, "sticker_count": None, "listing_id": "drop"},
+            ]
+        )
+
+        temp_dir = make_workspace_temp_dir("run_show")
+        input_path = temp_dir / "sample.csv"
+        dataframe.to_csv(input_path, index=False)
+        args = argparse.Namespace(
+            input_path=str(input_path),
+            min_float=None,
+            max_float=0.10,
+            min_price=None,
+            max_price=None,
+            wear=None,
+            paint_seed=None,
+            has_stickers=False,
+            no_stickers=False,
+            min_sticker_count=None,
+            max_sticker_count=None,
+            sort_by=["float"],
+            descending=False,
+            limit=25,
+            columns=None,
+        )
+        buffer = io.StringIO()
+
+        with redirect_stdout(buffer):
+            sme.run_show(args)
+
+        output_text = buffer.getvalue()
+        self.assertIn("Showing 1 of 1 matching rows", output_text)
+        self.assertIn("keep", output_text)
+        self.assertNotIn("drop", output_text)
+
     @patch("steam_market_to_excel.run_fetch")
     def test_main_uses_legacy_style_as_fetch_command(self, mocked_run_fetch):
         sme.main(["AK-47 | Redline (Field-Tested)"])
@@ -342,6 +617,41 @@ class TestListingAndExportFlow(unittest.TestCase):
         args = mocked_run_fetch.call_args.args[0]
         self.assertEqual(args.command, "fetch")
         self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
+
+    @patch("steam_market_to_excel.run_sort")
+    def test_main_uses_sort_subcommand(self, mocked_run_sort):
+        sme.main(["sort", "exports/sample.xlsx", "--by", "float"])
+
+        mocked_run_sort.assert_called_once()
+        args = mocked_run_sort.call_args.args[0]
+        self.assertEqual(args.command, "sort")
+        self.assertEqual(args.by, ["float"])
+
+    @patch("steam_market_to_excel.run_filter")
+    def test_main_uses_filter_subcommand(self, mocked_run_filter):
+        sme.main(["filter", "exports/sample.xlsx", "--max-float", "0.15"])
+
+        mocked_run_filter.assert_called_once()
+        args = mocked_run_filter.call_args.args[0]
+        self.assertEqual(args.command, "filter")
+        self.assertEqual(args.max_float, 0.15)
+
+    @patch("steam_market_to_excel.run_stats")
+    def test_main_uses_stats_subcommand(self, mocked_run_stats):
+        sme.main(["stats", "exports/sample.xlsx"])
+
+        mocked_run_stats.assert_called_once()
+        args = mocked_run_stats.call_args.args[0]
+        self.assertEqual(args.command, "stats")
+
+    @patch("steam_market_to_excel.run_show")
+    def test_main_uses_show_subcommand(self, mocked_run_show):
+        sme.main(["show", "exports/sample.xlsx", "--max-float", "0.10"])
+
+        mocked_run_show.assert_called_once()
+        args = mocked_run_show.call_args.args[0]
+        self.assertEqual(args.command, "show")
+        self.assertEqual(args.max_float, 0.10)
 
     @patch("steam_market_to_excel.run_fetch")
     def test_main_uses_fetch_subcommand(self, mocked_run_fetch):

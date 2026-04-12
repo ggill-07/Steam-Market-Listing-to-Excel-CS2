@@ -19,6 +19,8 @@ Thumbs.db
 out/
 exports/
 local_explanations/
+tests/_tmp_runtime/
+tmp*/
 *.xlsx
 *.csv
 
