@@ -2,6 +2,8 @@
 
 A command-line tool for scraping CS2 Steam Community Market listings, saving them to Excel or CSV, and then exploring the saved data from the terminal.
 
+The tool grew out of a simple problem: manually digging through thousands of Steam Market listings to find the few items that actually matched the float, price, sticker, and wear conditions you cared about.
+
 The project reads the metadata it can directly from Steam's own market payload instead of depending on CSFloat at runtime.
 
 ## What the tool can do
