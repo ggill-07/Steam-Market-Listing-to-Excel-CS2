@@ -151,6 +151,20 @@ class TestBasicHelpers(unittest.TestCase):
 
         self.assertEqual(result, newer_file)
 
+    def test_resolve_input_path_prefers_pinned_latest_file(self):
+        temp_dir = make_workspace_temp_dir("resolve_pinned_latest")
+        older_file = temp_dir / "older.xlsx"
+        pinned_file = temp_dir / "pinned.xlsx"
+        older_file.write_text("older", encoding="utf-8")
+        pinned_file.write_text("pinned", encoding="utf-8")
+        sme_pointer_path = temp_dir / sme.LATEST_POINTER_FILENAME
+        sme_pointer_path.write_text(str(pinned_file.resolve()), encoding="utf-8")
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            result = sme.resolve_input_path("latest")
+
+        self.assertEqual(result, pinned_file)
+
     def test_parse_args_supports_legacy_fetch_style(self):
         args = sme.parse_args(["AK-47 | Redline (Field-Tested)"])
 
@@ -185,6 +199,12 @@ class TestBasicHelpers(unittest.TestCase):
         args = sme.parse_args(["stats", "exports/sample.xlsx"])
 
         self.assertEqual(args.command, "stats")
+        self.assertEqual(args.input_path, "exports/sample.xlsx")
+
+    def test_parse_args_supports_use_subcommand(self):
+        args = sme.parse_args(["use", "exports/sample.xlsx"])
+
+        self.assertEqual(args.command, "use")
         self.assertEqual(args.input_path, "exports/sample.xlsx")
 
     def test_parse_args_supports_show_subcommand(self):
@@ -548,11 +568,14 @@ class TestListingAndExportFlow(unittest.TestCase):
             output=None,
         )
 
-        sme.run_sort(args)
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            sme.run_sort(args)
+            resolved_latest = sme.resolve_input_path("latest")
         output_path = input_path.with_name("sample_sorted.csv")
         sorted_dataframe = pd.read_csv(output_path)
 
         self.assertEqual(list(sorted_dataframe["listing_id"]), ["a", "b"])
+        self.assertEqual(resolved_latest, output_path)
 
     def test_run_filter_creates_filtered_output_file(self):
         dataframe = pd.DataFrame(
@@ -580,11 +603,14 @@ class TestListingAndExportFlow(unittest.TestCase):
             output=None,
         )
 
-        sme.run_filter(args)
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            sme.run_filter(args)
+            resolved_latest = sme.resolve_input_path("latest")
         output_path = input_path.with_name("sample_filtered.csv")
         filtered_dataframe = pd.read_csv(output_path)
 
         self.assertEqual(list(filtered_dataframe["listing_id"]), ["keep"])
+        self.assertEqual(resolved_latest, output_path)
 
     def test_run_stats_prints_summary(self):
         dataframe = pd.DataFrame(
@@ -645,6 +671,23 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertIn("keep", output_text)
         self.assertNotIn("drop", output_text)
 
+    def test_run_use_sets_latest_pointer(self):
+        temp_dir = make_workspace_temp_dir("run_use")
+        input_path = temp_dir / "sample.csv"
+        input_path.write_text("listing_id\nkeep\n", encoding="utf-8")
+        args = argparse.Namespace(input_path=str(input_path))
+        buffer = io.StringIO()
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            with redirect_stdout(buffer):
+                sme.run_use(args)
+
+            resolved_latest = sme.resolve_input_path("latest")
+
+        output_text = buffer.getvalue()
+        self.assertEqual(resolved_latest, input_path)
+        self.assertIn("latest now points to", output_text)
+
     @patch("steam_market_to_excel.run_fetch")
     def test_main_uses_legacy_style_as_fetch_command(self, mocked_run_fetch):
         sme.main(["AK-47 | Redline (Field-Tested)"])
@@ -679,6 +722,14 @@ class TestListingAndExportFlow(unittest.TestCase):
         mocked_run_stats.assert_called_once()
         args = mocked_run_stats.call_args.args[0]
         self.assertEqual(args.command, "stats")
+
+    @patch("steam_market_to_excel.run_use")
+    def test_main_uses_use_subcommand(self, mocked_run_use):
+        sme.main(["use", "exports/sample.xlsx"])
+
+        mocked_run_use.assert_called_once()
+        args = mocked_run_use.call_args.args[0]
+        self.assertEqual(args.command, "use")
 
     @patch("steam_market_to_excel.run_show")
     def test_main_uses_show_subcommand(self, mocked_run_show):

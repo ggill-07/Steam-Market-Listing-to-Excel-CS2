@@ -17,6 +17,7 @@ The project is released under the `MIT` license, so other people can use, modify
 - `filter` an existing export file and write only matching rows
 - `show` matching rows directly in the terminal
 - `stats` print summary information for an existing export file
+- `use` choose which export file the `latest` shortcut should point to
 
 The older direct fetch style still works too:
 
@@ -98,7 +99,8 @@ python -m pip install setuptools
 - float, paint seed, sticker presence, sticker count, and inspect-link data are read from Steam asset data when Steam includes them
 - temporary Steam failures like `429`, `500`, `502`, `503`, and `504` are retried automatically
 - plain output filenames are saved into the `exports/` folder by default
-- file-based commands can use `latest` as a shortcut for the newest export in `exports/`
+- file-based commands can use `latest` as a shortcut for the export file you most recently chose with `use`
+- if you have not chosen one with `use`, `latest` falls back to the newest export in `exports/`
 
 ## Basic usage
 
@@ -143,6 +145,7 @@ You can also use the PowerShell shortcut with the newer file-based commands:
 ```powershell
 smte show latest --max-float 0.10 --sort-by float --limit 10
 smte stats latest
+smte use exports/redline_filtered.xlsx
 ```
 
 ## Installable CLI command
@@ -246,6 +249,21 @@ Print a quick summary for an existing export file.
 smte stats latest
 ```
 
+### `use`
+
+Pick which file `latest` should mean from now on.
+
+```bash
+smte use exports/redline_filtered.xlsx
+```
+
+After that, commands like these will use the file you picked:
+
+```bash
+smte show latest --max-float 0.10
+smte stats latest
+```
+
 ## The `latest` shortcut
 
 For file-based commands, you can use:
@@ -254,7 +272,17 @@ For file-based commands, you can use:
 latest
 ```
 
-instead of typing a full file path. The tool will pick the newest `.xlsx`, `.xls`, or `.csv` file inside `exports/`.
+instead of typing a full file path.
+
+By default, the tool picks the newest `.xlsx`, `.xls`, or `.csv` file inside `exports/`.
+
+If you want to choose it yourself, run:
+
+```bash
+smte use exports/redline_filtered.xlsx
+```
+
+After that, `latest` will point to the file you selected until you pick another one or create a newer file with `fetch`, `sort`, or `filter`.
 
 This works with:
 
@@ -278,7 +306,7 @@ The current test suite covers:
 - DataFrame/export helpers
 - CLI argument parsing
 - command dispatch
-- file-based CLI workflows including `show`, `sort`, `filter`, `stats`, and `latest`
+- file-based CLI workflows including `show`, `sort`, `filter`, `stats`, `use`, and `latest`
 - packaging metadata for the installable `smte` command
 - Windows `.exe` build script wiring
 

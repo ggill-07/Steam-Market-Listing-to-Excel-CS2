@@ -33,7 +33,9 @@ DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_OUTPUT_DIR = Path("exports")
-CLI_COMMANDS = {"fetch", "sort", "filter", "stats", "show"}
+LATEST_POINTER_FILENAME = ".latest_export.txt"
+SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
+CLI_COMMANDS = {"fetch", "sort", "filter", "stats", "show", "use"}
 DEFAULT_SHOW_COLUMNS = [
     "page",
     "float",
@@ -327,16 +329,50 @@ def derive_output_path(input_name: str, suffix: str) -> Path:
     return input_path.with_name(derived_name)
 
 
+def get_latest_pointer_path() -> Path:
+    return DEFAULT_OUTPUT_DIR / LATEST_POINTER_FILENAME
+
+
+def find_newest_export_path() -> Path:
+    candidate_paths = [
+        path
+        for path in DEFAULT_OUTPUT_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_TABLE_SUFFIXES
+    ]
+    if not candidate_paths:
+        raise FileNotFoundError("No export files were found in exports/")
+    return max(candidate_paths, key=lambda path: path.stat().st_mtime)
+
+
+def read_latest_pointer() -> Optional[Path]:
+    pointer_path = get_latest_pointer_path()
+    if not pointer_path.exists():
+        return None
+
+    raw_target_path = pointer_path.read_text(encoding="utf-8").strip()
+    if not raw_target_path:
+        return None
+
+    target_path = Path(raw_target_path)
+    if target_path.exists() and target_path.is_file() and target_path.suffix.lower() in SUPPORTED_TABLE_SUFFIXES:
+        return target_path
+
+    return None
+
+
+def write_latest_pointer(target_path: Path) -> Path:
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    pointer_path = get_latest_pointer_path()
+    pointer_path.write_text(str(target_path.resolve()), encoding="utf-8")
+    return pointer_path
+
+
 def resolve_input_path(input_name: str) -> Path:
     if input_name.lower() == "latest":
-        candidate_paths = [
-            path
-            for path in DEFAULT_OUTPUT_DIR.iterdir()
-            if path.is_file() and path.suffix.lower() in {".csv", ".xlsx", ".xls"}
-        ]
-        if not candidate_paths:
-            raise FileNotFoundError("No export files were found in exports/")
-        return max(candidate_paths, key=lambda path: path.stat().st_mtime)
+        pinned_path = read_latest_pointer()
+        if pinned_path is not None:
+            return pinned_path
+        return find_newest_export_path()
 
     return Path(input_name)
 
@@ -664,6 +700,10 @@ def add_stats_arguments(parser: argparse.ArgumentParser) -> None:
     add_input_path_argument(parser)
 
 
+def add_use_arguments(parser: argparse.ArgumentParser) -> None:
+    add_input_path_argument(parser)
+
+
 def build_legacy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scrape Steam Community Market listings for a CS2 item and export to Excel."
@@ -717,6 +757,13 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     add_stats_arguments(stats_parser)
 
+    use_parser = subparsers.add_parser(
+        "use",
+        help="Set which export file the latest shortcut should point to.",
+        description="Set which export file the latest shortcut should point to.",
+    )
+    add_use_arguments(use_parser)
+
     return parser
 
 
@@ -756,6 +803,7 @@ def run_fetch(args: argparse.Namespace) -> None:
 
     df = rows_to_dataframe(rows)
     output_path = save_table(df, args.output)
+    write_latest_pointer(output_path)
 
     print(f"Exported {len(df)} listings to {output_path}")
 
@@ -766,6 +814,7 @@ def run_sort(args: argparse.Namespace) -> None:
     sorted_dataframe = sort_dataframe(dataframe, args.by, args.descending)
     output_name = args.output or str(derive_output_path(str(resolved_input_path), "sorted"))
     output_path = save_table(sorted_dataframe, output_name)
+    write_latest_pointer(output_path)
 
     print(f"Sorted {len(sorted_dataframe)} rows into {output_path}")
 
@@ -777,6 +826,7 @@ def run_filter(args: argparse.Namespace) -> None:
 
     output_name = args.output or str(derive_output_path(str(resolved_input_path), "filtered"))
     output_path = save_table(filtered_dataframe, output_name)
+    write_latest_pointer(output_path)
 
     print(f"Filtered {len(filtered_dataframe)} rows into {output_path}")
 
@@ -809,6 +859,17 @@ def run_show(args: argparse.Namespace) -> None:
     print(display_dataframe.to_string(index=False))
 
 
+def run_use(args: argparse.Namespace) -> None:
+    resolved_input_path = resolve_input_path(args.input_path)
+    if not resolved_input_path.exists() or not resolved_input_path.is_file():
+        raise FileNotFoundError(f"Input file was not found: {resolved_input_path}")
+    if resolved_input_path.suffix.lower() not in SUPPORTED_TABLE_SUFFIXES:
+        raise ValueError("Input file must be a .csv, .xlsx, or .xls file")
+
+    write_latest_pointer(resolved_input_path)
+    print(f"latest now points to {resolved_input_path.resolve()}")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     if args.command == "fetch":
@@ -821,6 +882,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         run_show(args)
     elif args.command == "stats":
         run_stats(args)
+    elif args.command == "use":
+        run_use(args)
 
 
 if __name__ == "__main__":
