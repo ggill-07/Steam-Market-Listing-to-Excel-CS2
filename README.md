@@ -8,6 +8,8 @@ The tool grew out of a simple problem: manually digging through thousands of Ste
 
 The project reads the metadata it can directly from Steam's own market payload instead of depending on CSFloat at runtime.
 
+The project is released under the `MIT` license, so other people can use, modify, and share it with attribution.
+
 ## What the tool can do
 
 - `fetch` Steam Community Market listings for a CS2 item and save them to a file

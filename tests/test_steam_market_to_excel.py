@@ -215,6 +215,13 @@ class TestBasicHelpers(unittest.TestCase):
             ["steam_market_to_excel"],
         )
 
+    def test_license_file_exists_and_mentions_mit(self):
+        license_path = PROJECT_ROOT / "LICENSE"
+        license_text = license_path.read_text(encoding="utf-8")
+
+        self.assertIn("MIT License", license_text)
+        self.assertIn("Permission is hereby granted, free of charge", license_text)
+
     def test_windows_exe_build_script_exists_and_targets_main_script(self):
         build_script_path = PROJECT_ROOT / "scripts" / "build_windows_exe.ps1"
         script_text = build_script_path.read_text(encoding="utf-8")
