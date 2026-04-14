@@ -14,6 +14,7 @@ Steam's asset payload, and writes an Excel sheet with:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import sys
 import time
@@ -28,14 +29,16 @@ import requests
 STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
 PAGE_SIZE = 100
-DEFAULT_STEAM_PAGE_DELAY = 1.0
+DEFAULT_STEAM_PAGE_DELAY = 0.0
 DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_OUTPUT_DIR = Path("exports")
 LATEST_POINTER_FILENAME = ".latest_export.txt"
 SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
-CLI_COMMANDS = {"fetch", "sort", "filter", "stats", "show", "use"}
+CLI_COMMANDS = {"fetch", "fetch-many", "sort", "filter", "stats", "show", "use"}
+DEFAULT_FETCH_MANY_WORKERS = 3
+RIGHT_ALIGN_COLUMNS = {"page", "float", "price", "paint_seed", "sticker_count"}
 DEFAULT_SHOW_COLUMNS = [
     "page",
     "float",
@@ -60,6 +63,14 @@ class ListingRow:
     has_stickers: Optional[bool]
     sticker_count: Optional[int]
     inspect_link: Optional[str]
+
+
+@dataclass
+class FetchResult:
+    market_hash_name: str
+    output_path: Path
+    dataframe: pd.DataFrame
+    change_summary: Optional[Dict[str, int]]
 
 
 def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
@@ -313,6 +324,15 @@ def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def slugify_market_hash_name(market_hash_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", market_hash_name.lower()).strip("_")
+    return slug or "steam_listings"
+
+
+def default_fetch_output_name(market_hash_name: str) -> str:
+    return f"{slugify_market_hash_name(market_hash_name)}.xlsx"
+
+
 def resolve_output_path(output_name: str) -> Path:
     output_path = Path(output_name)
     if output_path.parent == Path("."):
@@ -538,6 +558,198 @@ def build_show_dataframe(
     return display_dataframe
 
 
+def format_terminal_table(display_dataframe: pd.DataFrame) -> str:
+    if display_dataframe.empty:
+        return ""
+
+    rendered_dataframe = display_dataframe.astype(str)
+    column_widths = {
+        column: max(
+            len(str(column)),
+            max(len(str(value)) for value in rendered_dataframe[column].tolist()),
+        )
+        for column in rendered_dataframe.columns
+    }
+
+    def format_cell(column: str, value: str) -> str:
+        width = column_widths[column]
+        if column in RIGHT_ALIGN_COLUMNS:
+            return value.rjust(width)
+        return value.ljust(width)
+
+    header_line = " | ".join(
+        format_cell(column, str(column))
+        for column in rendered_dataframe.columns
+    )
+    separator_line = "-+-".join("-" * column_widths[column] for column in rendered_dataframe.columns)
+    row_lines = [
+        " | ".join(
+            format_cell(column, str(row[column]))
+            for column in rendered_dataframe.columns
+        )
+        for _, row in rendered_dataframe.iterrows()
+    ]
+
+    return "\n".join([header_line, separator_line, *row_lines])
+
+
+def describe_listing_changes(
+    previous_dataframe: Optional[pd.DataFrame],
+    current_dataframe: pd.DataFrame,
+) -> Optional[Dict[str, int]]:
+    if previous_dataframe is None:
+        return None
+    if "listing_id" not in previous_dataframe.columns or "listing_id" not in current_dataframe.columns:
+        return None
+
+    previous_listing_ids = {
+        str(listing_id)
+        for listing_id in previous_dataframe["listing_id"].dropna().tolist()
+    }
+    current_listing_ids = {
+        str(listing_id)
+        for listing_id in current_dataframe["listing_id"].dropna().tolist()
+    }
+
+    return {
+        "added": len(current_listing_ids - previous_listing_ids),
+        "removed": len(previous_listing_ids - current_listing_ids),
+        "unchanged": len(current_listing_ids & previous_listing_ids),
+    }
+
+
+def create_requests_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+    )
+    return session
+
+
+def dataframe_matches_inline_query(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    filtered_dataframe = filter_dataframe(dataframe, args)
+    if getattr(args, "sort_by", None):
+        filtered_dataframe = sort_dataframe(filtered_dataframe, args.sort_by, args.descending)
+    return filtered_dataframe
+
+
+def has_inline_fetch_query(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, attribute_name, None)
+        for attribute_name in (
+            "min_float",
+            "max_float",
+            "min_price",
+            "max_price",
+            "wear",
+            "paint_seed",
+            "has_stickers",
+            "no_stickers",
+            "min_sticker_count",
+            "max_sticker_count",
+            "sort_by",
+            "show",
+        )
+    )
+
+
+def print_matching_rows(
+    label: str,
+    filtered_dataframe: pd.DataFrame,
+    limit: Optional[int],
+    columns: Optional[List[str]],
+) -> None:
+    display_dataframe = build_show_dataframe(
+        filtered_dataframe,
+        columns=columns,
+        limit=limit,
+    )
+    print(f"Showing {len(display_dataframe)} of {len(filtered_dataframe)} matching rows from {label}")
+    if display_dataframe.empty:
+        return
+
+    print(format_terminal_table(display_dataframe))
+
+
+def print_fetch_inline_summary(
+    market_hash_name: str,
+    output_path: Path,
+    dataframe: pd.DataFrame,
+    args: argparse.Namespace,
+) -> None:
+    if not has_inline_fetch_query(args):
+        return
+
+    filtered_dataframe = dataframe_matches_inline_query(dataframe, args)
+    print(
+        f"Inline query matched {len(filtered_dataframe)} rows for {market_hash_name} "
+        f"from {output_path}"
+    )
+
+    if args.show:
+        print_matching_rows(
+            label=f"{market_hash_name} ({output_path.name})",
+            filtered_dataframe=filtered_dataframe,
+            limit=args.limit,
+            columns=args.columns,
+        )
+
+
+def build_fetch_result_summary(result: FetchResult) -> str:
+    if result.change_summary is None:
+        return f"Exported {len(result.dataframe)} listings to {result.output_path}"
+
+    return (
+        f"Synced {len(result.dataframe)} current listings to {result.output_path} "
+        f"(added {result.change_summary['added']}, removed {result.change_summary['removed']}, "
+        f"unchanged {result.change_summary['unchanged']})"
+    )
+
+
+def fetch_market_dataframe(args: argparse.Namespace, market_hash_name: str) -> pd.DataFrame:
+    session = create_requests_session()
+    rows = list(
+        iter_listings(
+            session=session,
+            market_hash_name=market_hash_name,
+            currency=args.currency,
+            country=args.country,
+            language=args.language,
+            steam_page_delay=args.steam_page_delay,
+            steam_max_retries=args.steam_max_retries,
+        )
+    )
+    return rows_to_dataframe(rows)
+
+
+def sync_market_dataframe(
+    dataframe: pd.DataFrame,
+    market_hash_name: str,
+    output_name: Optional[str] = None,
+    update_latest: bool = True,
+) -> FetchResult:
+    resolved_output_name = output_name or default_fetch_output_name(market_hash_name)
+    output_path = resolve_output_path(resolved_output_name)
+    previous_dataframe = load_table(str(output_path)) if output_path.exists() else None
+
+    save_table(dataframe, str(output_path))
+    if update_latest:
+        write_latest_pointer(output_path)
+
+    return FetchResult(
+        market_hash_name=market_hash_name,
+        output_path=output_path,
+        dataframe=dataframe,
+        change_summary=describe_listing_changes(previous_dataframe, dataframe),
+    )
+
+
 def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "market_hash_name",
@@ -546,8 +758,8 @@ def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="steam_listings.xlsx",
-        help="Output Excel filename. Plain filenames are saved inside exports/",
+        default=None,
+        help="Output Excel filename. If omitted, the tool derives one from the market name inside exports/",
     )
     parser.add_argument("--currency", type=int, default=1,
                         help="Steam currency ID (default: 1 for USD)")
@@ -559,13 +771,168 @@ def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
         "--steam-page-delay",
         type=float,
         default=DEFAULT_STEAM_PAGE_DELAY,
-        help="Seconds to wait between Steam listing page requests (default: 1.0)",
+        help="Seconds to wait between Steam listing page requests (default: 0.0)",
     )
     parser.add_argument(
         "--steam-max-retries",
         type=int,
         default=DEFAULT_STEAM_RETRIES,
         help="How many times to retry a Steam page after HTTP 429 (default: 5)",
+    )
+    parser.add_argument("--min-float", type=float, default=None, help="After fetching, keep rows with float >= this value")
+    parser.add_argument("--max-float", type=float, default=None, help="After fetching, keep rows with float <= this value")
+    parser.add_argument("--min-price", type=float, default=None, help="After fetching, keep rows with price >= this value")
+    parser.add_argument("--max-price", type=float, default=None, help="After fetching, keep rows with price <= this value")
+    parser.add_argument("--wear", default=None, help="After fetching, keep only rows with this wear value")
+    parser.add_argument("--paint-seed", type=int, default=None, help="After fetching, keep only rows with this paint seed")
+
+    sticker_group = parser.add_mutually_exclusive_group()
+    sticker_group.add_argument(
+        "--has-stickers",
+        action="store_true",
+        help="After fetching, keep only rows that have stickers",
+    )
+    sticker_group.add_argument(
+        "--no-stickers",
+        action="store_true",
+        help="After fetching, keep only rows that do not have stickers",
+    )
+
+    parser.add_argument(
+        "--min-sticker-count",
+        type=int,
+        default=None,
+        help="After fetching, keep rows with sticker_count >= this value",
+    )
+    parser.add_argument(
+        "--max-sticker-count",
+        type=int,
+        default=None,
+        help="After fetching, keep rows with sticker_count <= this value",
+    )
+    parser.add_argument(
+        "--sort-by",
+        nargs="+",
+        default=None,
+        help="After fetching, sort matching rows by these columns",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        help="Use descending order for inline fetch sorting",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="After fetching, print the matching rows directly in the terminal",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Maximum number of inline fetch rows to show in the terminal (default: 25)",
+    )
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        default=None,
+        help="Column names to show in inline fetch terminal output",
+    )
+
+
+def add_fetch_many_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "market_hash_names",
+        nargs="*",
+        help='One or more exact Steam market names, e.g. "AK-47 | Redline (Field-Tested)"',
+    )
+    parser.add_argument(
+        "--items-file",
+        default=None,
+        help="Optional text file with one exact Steam market name per line",
+    )
+    parser.add_argument("--currency", type=int, default=1,
+                        help="Steam currency ID (default: 1 for USD)")
+    parser.add_argument("--country", default="US",
+                        help="Steam country code (default: US)")
+    parser.add_argument("--language", default="english",
+                        help="Steam language (default: english)")
+    parser.add_argument(
+        "--steam-page-delay",
+        type=float,
+        default=DEFAULT_STEAM_PAGE_DELAY,
+        help="Seconds to wait between Steam listing page requests inside each worker (default: 0.0)",
+    )
+    parser.add_argument(
+        "--steam-max-retries",
+        type=int,
+        default=DEFAULT_STEAM_RETRIES,
+        help="How many times to retry a Steam page after HTTP 429 (default: 5)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_FETCH_MANY_WORKERS,
+        help="How many market items to fetch in parallel (default: 3)",
+    )
+    parser.add_argument("--min-float", type=float, default=None, help="After fetching, keep rows with float >= this value")
+    parser.add_argument("--max-float", type=float, default=None, help="After fetching, keep rows with float <= this value")
+    parser.add_argument("--min-price", type=float, default=None, help="After fetching, keep rows with price >= this value")
+    parser.add_argument("--max-price", type=float, default=None, help="After fetching, keep rows with price <= this value")
+    parser.add_argument("--wear", default=None, help="After fetching, keep only rows with this wear value")
+    parser.add_argument("--paint-seed", type=int, default=None, help="After fetching, keep only rows with this paint seed")
+
+    sticker_group = parser.add_mutually_exclusive_group()
+    sticker_group.add_argument(
+        "--has-stickers",
+        action="store_true",
+        help="After fetching, keep only rows that have stickers",
+    )
+    sticker_group.add_argument(
+        "--no-stickers",
+        action="store_true",
+        help="After fetching, keep only rows that do not have stickers",
+    )
+
+    parser.add_argument(
+        "--min-sticker-count",
+        type=int,
+        default=None,
+        help="After fetching, keep rows with sticker_count >= this value",
+    )
+    parser.add_argument(
+        "--max-sticker-count",
+        type=int,
+        default=None,
+        help="After fetching, keep rows with sticker_count <= this value",
+    )
+    parser.add_argument(
+        "--sort-by",
+        nargs="+",
+        default=None,
+        help="After fetching, sort matching rows by these columns",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        help="Use descending order for inline fetch-many sorting",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="After fetching each item, print the matching rows directly in the terminal",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Maximum number of inline fetch-many rows to show per item in the terminal (default: 25)",
+    )
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        default=None,
+        help="Column names to show in inline fetch-many terminal output",
     )
 
 
@@ -729,6 +1096,13 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     add_fetch_arguments(fetch_parser)
 
+    fetch_many_parser = subparsers.add_parser(
+        "fetch-many",
+        help="Fetch multiple Steam Community Market items in parallel.",
+        description="Fetch multiple Steam Community Market items in parallel.",
+    )
+    add_fetch_many_arguments(fetch_many_parser)
+
     sort_parser = subparsers.add_parser(
         "sort",
         help="Sort an existing export file and write a new file.",
@@ -778,34 +1152,97 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def run_fetch(args: argparse.Namespace) -> None:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
+    dataframe = fetch_market_dataframe(args, args.market_hash_name)
+    result = sync_market_dataframe(
+        dataframe=dataframe,
+        market_hash_name=args.market_hash_name,
+        output_name=args.output,
+        update_latest=True,
+    )
+    print(build_fetch_result_summary(result))
+    print_fetch_inline_summary(
+        market_hash_name=args.market_hash_name,
+        output_path=result.output_path,
+        dataframe=result.dataframe,
+        args=args,
     )
 
-    rows = list(
-        iter_listings(
-            session=session,
-            market_hash_name=args.market_hash_name,
-            currency=args.currency,
-            country=args.country,
-            language=args.language,
-            steam_page_delay=args.steam_page_delay,
-            steam_max_retries=args.steam_max_retries,
+
+def collect_market_hash_names(args: argparse.Namespace) -> List[str]:
+    market_hash_names = list(args.market_hash_names or [])
+
+    if args.items_file:
+        items_file_path = Path(args.items_file)
+        file_market_hash_names = [
+            line.strip()
+            for line in items_file_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        market_hash_names.extend(file_market_hash_names)
+
+    deduplicated_market_hash_names: List[str] = []
+    seen_market_hash_names = set()
+    for market_hash_name in market_hash_names:
+        if market_hash_name not in seen_market_hash_names:
+            deduplicated_market_hash_names.append(market_hash_name)
+            seen_market_hash_names.add(market_hash_name)
+
+    if not deduplicated_market_hash_names:
+        raise ValueError("fetch-many needs at least one market name or an --items-file")
+
+    return deduplicated_market_hash_names
+
+
+def run_fetch_many(args: argparse.Namespace) -> None:
+    market_hash_names = collect_market_hash_names(args)
+    max_workers = max(1, min(args.workers, len(market_hash_names)))
+    print(f"Fetching {len(market_hash_names)} items with {max_workers} worker(s)...")
+
+    results_by_market_name: Dict[str, FetchResult] = {}
+    errors_by_market_name: Dict[str, Exception] = {}
+
+    def fetch_one_item(market_hash_name: str) -> FetchResult:
+        dataframe = fetch_market_dataframe(args, market_hash_name)
+        return sync_market_dataframe(
+            dataframe=dataframe,
+            market_hash_name=market_hash_name,
+            output_name=None,
+            update_latest=False,
         )
-    )
 
-    df = rows_to_dataframe(rows)
-    output_path = save_table(df, args.output)
-    write_latest_pointer(output_path)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_market_name = {
+            executor.submit(fetch_one_item, market_hash_name): market_hash_name
+            for market_hash_name in market_hash_names
+        }
 
-    print(f"Exported {len(df)} listings to {output_path}")
+        for future in as_completed(future_to_market_name):
+            market_hash_name = future_to_market_name[future]
+            try:
+                result = future.result()
+                results_by_market_name[market_hash_name] = result
+                print(build_fetch_result_summary(result))
+                print_fetch_inline_summary(
+                    market_hash_name=market_hash_name,
+                    output_path=result.output_path,
+                    dataframe=result.dataframe,
+                    args=args,
+                )
+            except Exception as exc:  # pragma: no cover - exercised via behavior, not exact type branching
+                errors_by_market_name[market_hash_name] = exc
+                print(f"Failed to fetch {market_hash_name}: {exc}")
+
+    for market_hash_name in reversed(market_hash_names):
+        if market_hash_name in results_by_market_name:
+            write_latest_pointer(results_by_market_name[market_hash_name].output_path)
+            break
+
+    if errors_by_market_name:
+        failed_count = len(errors_by_market_name)
+        success_count = len(results_by_market_name)
+        raise RuntimeError(
+            f"fetch-many finished with {success_count} success(es) and {failed_count} failure(s)"
+        )
 
 
 def run_sort(args: argparse.Namespace) -> None:
@@ -846,17 +1283,12 @@ def run_show(args: argparse.Namespace) -> None:
     if args.sort_by:
         filtered_dataframe = sort_dataframe(filtered_dataframe, args.sort_by, args.descending)
 
-    display_dataframe = build_show_dataframe(
-        filtered_dataframe,
-        columns=args.columns,
+    print_matching_rows(
+        label=str(resolved_input_path),
+        filtered_dataframe=filtered_dataframe,
         limit=args.limit,
+        columns=args.columns,
     )
-
-    print(f"Showing {len(display_dataframe)} of {len(filtered_dataframe)} matching rows from {resolved_input_path}")
-    if display_dataframe.empty:
-        return
-
-    print(display_dataframe.to_string(index=False))
 
 
 def run_use(args: argparse.Namespace) -> None:
@@ -874,6 +1306,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     if args.command == "fetch":
         run_fetch(args)
+    elif args.command == "fetch-many":
+        run_fetch_many(args)
     elif args.command == "sort":
         run_sort(args)
     elif args.command == "filter":

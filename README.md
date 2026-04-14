@@ -13,6 +13,9 @@ The project is released under the `MIT` license, so other people can use, modify
 ## What the tool can do
 
 - `fetch` Steam Community Market listings for a CS2 item and save them to a file
+- `fetch` now reuses a stable per-item file name by default and syncs that file in place
+- `fetch` can now filter, sort, and optionally show matching rows in the same command
+- `fetch-many` can fetch multiple items in parallel
 - `sort` an existing export file by one or more columns
 - `filter` an existing export file and write only matching rows
 - `show` matching rows directly in the terminal
@@ -99,6 +102,10 @@ python -m pip install setuptools
 - float, paint seed, sticker presence, sticker count, and inspect-link data are read from Steam asset data when Steam includes them
 - temporary Steam failures like `429`, `500`, `502`, `503`, and `504` are retried automatically
 - plain output filenames are saved into the `exports/` folder by default
+- if `fetch` is run without `-o`, it derives a stable filename from the item name, such as `ak_47_redline_field_tested.xlsx`
+- fetching the same item again updates that same file in place and reports how many listings were added, removed, or stayed the same
+- `fetch` can immediately filter, sort, and show the current results without making you run separate commands afterward
+- `fetch-many` can process several market names in parallel and sync one file per item
 - file-based commands can use `latest` as a shortcut for the export file you most recently chose with `use`
 - if you have not chosen one with `use`, `latest` falls back to the newest export in `exports/`
 
@@ -110,10 +117,28 @@ Recommended installed usage:
 smte fetch "AK-47 | Redline (Field-Tested)" -o redline.xlsx
 ```
 
+If you omit `-o`, the tool now derives a stable per-item filename automatically:
+
+```bash
+smte fetch "AK-47 | Redline (Field-Tested)"
+```
+
+That will save to something like:
+
+```bash
+exports/ak_47_redline_field_tested.xlsx
+```
+
 Direct Python usage still works too:
 
 ```bash
 python src/steam_market_to_excel.py fetch "AK-47 | Redline (Field-Tested)" -o redline.xlsx
+```
+
+You can also fetch, filter, sort, and show in one line:
+
+```bash
+smte fetch "AK-47 | Safari Mesh (Minimal Wear)" --max-float 0.10 --max-price 5.00 --sort-by float price --show --limit 10
 ```
 
 If you have not installed the project yet and you use PowerShell often, you can create a short helper function so you can still run the tool as `smte` instead of typing the full Python command each time:
@@ -176,14 +201,66 @@ Scrape Steam and save a new export file.
 smte fetch "MP5-SD | Neon Squeezer (Field-Tested)" -o mp5_neon_squeezer_ft.xlsx
 ```
 
+If you omit `-o`, `fetch` derives a filename from the market name and reuses that same file on later fetches of the same item.
+
+When that file already exists, `fetch` syncs it in place and prints a summary like:
+
+```text
+Synced 6846 current listings to exports/ak_47_safari_mesh_minimal_wear.xlsx (added 120, removed 98, unchanged 6628)
+```
+
+You can also use `fetch` as a one-line fetch/filter/sort/show workflow:
+
+```bash
+smte fetch "AK-47 | Safari Mesh (Minimal Wear)" --max-float 0.10 --max-price 5.00 --sort-by float price --show --limit 10
+```
+
 Useful options:
 
 - `--currency` - Steam currency ID, default `1` for USD
 - `--country` - Steam country code, default `US`
 - `--language` - Steam language, default `english`
-- `--steam-page-delay` - seconds to wait between Steam page requests, default `1.0`
+- `--steam-page-delay` - seconds to wait between Steam page requests, default `0.0`
 - `--steam-max-retries` - retry count for temporary Steam errors, default `5`
 - `-o/--output` - plain filenames go into `exports/`; custom paths are respected
+- `--min-float` / `--max-float`
+- `--min-price` / `--max-price`
+- `--wear`
+- `--paint-seed`
+- `--has-stickers` / `--no-stickers`
+- `--min-sticker-count` / `--max-sticker-count`
+- `--sort-by`
+- `--descending`
+- `--show`
+- `--limit`
+- `--columns`
+
+### `fetch-many`
+
+Fetch multiple market items in parallel and sync one file per item.
+
+```bash
+smte fetch-many "AK-47 | Safari Mesh (Minimal Wear)" "MP7 | Astrolabe (Minimal Wear)" --workers 3
+```
+
+You can also load the item names from a text file with one item per line:
+
+```bash
+smte fetch-many --items-file items.txt --workers 3
+```
+
+Like `fetch`, this command can also filter, sort, and show matching rows inline:
+
+```bash
+smte fetch-many --items-file items.txt --max-float 0.10 --sort-by float --show --limit 5
+```
+
+Useful options:
+
+- `--items-file` - text file with one exact Steam market name per line
+- `--workers` - how many items to fetch in parallel, default `3`
+- `--steam-page-delay` - delay inside each worker, default `0.0`
+- all the same inline filter/sort/show options supported by `fetch`
 
 ### `show`
 
@@ -291,6 +368,23 @@ This works with:
 - `filter`
 - `stats`
 
+## Speed notes
+
+This branch now defaults to a much faster fetch configuration than before:
+
+- `fetch` uses a default Steam page delay of `0.0`
+- `fetch-many` uses `3` workers by default
+
+In live probes during development on this branch:
+
+- `20` straight market page requests at `0.0` delay completed successfully in one session
+- `3` items fetched in parallel with `3` workers also completed successfully in a small parallel probe
+
+That does not guarantee Steam will always allow the same speed forever, so if you start seeing more `429` or `502` responses, the first things to try are:
+
+- increase `--steam-page-delay` to `0.10` or `0.25`
+- reduce `--workers` to `2` or `1`
+
 ## Running tests
 
 Run the full test suite with:
@@ -306,7 +400,9 @@ The current test suite covers:
 - DataFrame/export helpers
 - CLI argument parsing
 - command dispatch
-- file-based CLI workflows including `show`, `sort`, `filter`, `stats`, `use`, and `latest`
+- file-based CLI workflows including `fetch`, `fetch-many`, `show`, `sort`, `filter`, `stats`, `use`, and `latest`
+- stable per-item fetch output naming and in-place sync summaries
+- inline fetch filtering, sorting, and terminal display
 - packaging metadata for the installable `smte` command
 - Windows `.exe` build script wiring
 

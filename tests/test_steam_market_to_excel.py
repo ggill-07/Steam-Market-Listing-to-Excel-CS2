@@ -128,6 +128,10 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.resolve_output_path("result.xlsx")
         self.assertEqual(result, sme.DEFAULT_OUTPUT_DIR / "result.xlsx")
 
+    def test_default_fetch_output_name_uses_market_name_slug(self):
+        result = sme.default_fetch_output_name("AK-47 | Safari Mesh (Minimal Wear)")
+        self.assertEqual(result, "ak_47_safari_mesh_minimal_wear.xlsx")
+
     def test_resolve_output_path_keeps_custom_folder_paths(self):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
         self.assertEqual(result, Path("custom_folder") / "result.xlsx")
@@ -170,16 +174,45 @@ class TestBasicHelpers(unittest.TestCase):
 
         self.assertEqual(args.command, "fetch")
         self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
-        self.assertEqual(args.output, "steam_listings.xlsx")
+        self.assertIsNone(args.output)
 
     def test_parse_args_supports_fetch_subcommand(self):
         args = sme.parse_args(
-            ["fetch", "AK-47 | Redline (Field-Tested)", "-o", "custom.xlsx"]
+            ["fetch", "AK-47 | Redline (Field-Tested)", "-o", "custom.xlsx", "--max-float", "0.10", "--sort-by", "float", "--show"]
         )
 
         self.assertEqual(args.command, "fetch")
         self.assertEqual(args.market_hash_name, "AK-47 | Redline (Field-Tested)")
         self.assertEqual(args.output, "custom.xlsx")
+        self.assertEqual(args.max_float, 0.10)
+        self.assertEqual(args.sort_by, ["float"])
+        self.assertTrue(args.show)
+
+    def test_parse_args_supports_fetch_many_subcommand(self):
+        args = sme.parse_args(
+            [
+                "fetch-many",
+                "AK-47 | Redline (Field-Tested)",
+                "M4A1-S | Basilisk (Field-Tested)",
+                "--workers",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.command, "fetch-many")
+        self.assertEqual(
+            args.market_hash_names,
+            ["AK-47 | Redline (Field-Tested)", "M4A1-S | Basilisk (Field-Tested)"],
+        )
+        self.assertEqual(args.workers, 2)
+
+    def test_describe_listing_changes_counts_added_removed_and_unchanged(self):
+        previous_dataframe = pd.DataFrame([{"listing_id": "1"}, {"listing_id": "2"}])
+        current_dataframe = pd.DataFrame([{"listing_id": "2"}, {"listing_id": "3"}])
+
+        result = sme.describe_listing_changes(previous_dataframe, current_dataframe)
+
+        self.assertEqual(result, {"added": 1, "removed": 1, "unchanged": 1})
 
     def test_parse_args_supports_sort_subcommand(self):
         args = sme.parse_args(["sort", "exports/sample.xlsx", "--by", "float", "price"])
@@ -550,6 +583,253 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertEqual(display_dataframe.iloc[0]["price"], "2.00")
         self.assertEqual(display_dataframe.iloc[0]["stickers"], "yes")
 
+    def test_format_terminal_table_draws_a_readable_grid(self):
+        display_dataframe = pd.DataFrame(
+            [
+                {"page": "1", "float": "0.123456", "price": "2.00", "wear": "Minimal Wear"},
+                {"page": "2", "float": "0.200000", "price": "3.50", "wear": "Field-Tested"},
+            ]
+        )
+
+        table_text = sme.format_terminal_table(display_dataframe)
+
+        self.assertIn("page", table_text)
+        self.assertIn("Minimal Wear", table_text)
+        self.assertIn("-+-", table_text)
+
+    @patch("steam_market_to_excel.iter_listings")
+    @patch("steam_market_to_excel.requests.Session")
+    def test_run_fetch_reuses_market_name_based_output_file(self, mocked_session_cls, mocked_iter_listings):
+        mocked_session = Mock()
+        mocked_session.headers = Mock()
+        mocked_session.headers.update = Mock()
+        mocked_session_cls.return_value = mocked_session
+        mocked_iter_listings.return_value = [
+            sme.ListingRow(
+                listing_id="listing-1",
+                asset_id="asset-1",
+                page=1,
+                price=1.5,
+                currency="1",
+                float_value=0.12,
+                wear="Minimal Wear",
+                paint_seed=7,
+                has_stickers=True,
+                sticker_count=1,
+                inspect_link="steam://inspect",
+            )
+        ]
+
+        temp_dir = make_workspace_temp_dir("run_fetch_default_name")
+        args = argparse.Namespace(
+            market_hash_name="AK-47 | Safari Mesh (Minimal Wear)",
+            output=None,
+            currency=1,
+            country="US",
+            language="english",
+            steam_page_delay=0,
+            steam_max_retries=1,
+        )
+        buffer = io.StringIO()
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            with redirect_stdout(buffer):
+                sme.run_fetch(args)
+
+        output_text = buffer.getvalue()
+        output_path = temp_dir / "ak_47_safari_mesh_minimal_wear.xlsx"
+        self.assertTrue(output_path.exists())
+        self.assertIn(str(output_path), output_text)
+        self.assertTrue(
+            "Exported 1 listings to" in output_text
+            or "Synced 1 current listings to" in output_text
+        )
+
+    @patch("steam_market_to_excel.iter_listings")
+    @patch("steam_market_to_excel.requests.Session")
+    def test_run_fetch_supports_inline_filter_sort_and_show(self, mocked_session_cls, mocked_iter_listings):
+        mocked_session = Mock()
+        mocked_session.headers = Mock()
+        mocked_session.headers.update = Mock()
+        mocked_session_cls.return_value = mocked_session
+        mocked_iter_listings.return_value = [
+            sme.ListingRow(
+                listing_id="listing-2",
+                asset_id="asset-2",
+                page=1,
+                price=2.5,
+                currency="1",
+                float_value=0.08,
+                wear="Minimal Wear",
+                paint_seed=9,
+                has_stickers=True,
+                sticker_count=1,
+                inspect_link="steam://inspect2",
+            ),
+            sme.ListingRow(
+                listing_id="listing-3",
+                asset_id="asset-3",
+                page=1,
+                price=9.5,
+                currency="1",
+                float_value=0.20,
+                wear="Field-Tested",
+                paint_seed=10,
+                has_stickers=None,
+                sticker_count=None,
+                inspect_link="steam://inspect3",
+            ),
+        ]
+
+        temp_dir = make_workspace_temp_dir("run_fetch_inline")
+        args = argparse.Namespace(
+            market_hash_name="AK-47 | Safari Mesh (Minimal Wear)",
+            output=None,
+            currency=1,
+            country="US",
+            language="english",
+            steam_page_delay=0,
+            steam_max_retries=1,
+            min_float=None,
+            max_float=0.10,
+            min_price=None,
+            max_price=5.0,
+            wear=None,
+            paint_seed=None,
+            has_stickers=False,
+            no_stickers=False,
+            min_sticker_count=None,
+            max_sticker_count=None,
+            sort_by=["float"],
+            descending=False,
+            show=True,
+            limit=25,
+            columns=None,
+        )
+        buffer = io.StringIO()
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            with redirect_stdout(buffer):
+                sme.run_fetch(args)
+
+        output_text = buffer.getvalue()
+        self.assertIn("Inline query matched 1 rows", output_text)
+        self.assertIn("Showing 1 of 1 matching rows", output_text)
+        self.assertIn("listing-2", output_text)
+        self.assertNotIn("listing-3", output_text)
+
+    @patch("steam_market_to_excel.iter_listings")
+    @patch("steam_market_to_excel.requests.Session")
+    def test_run_fetch_syncs_existing_file_in_place(self, mocked_session_cls, mocked_iter_listings):
+        mocked_session = Mock()
+        mocked_session.headers = Mock()
+        mocked_session.headers.update = Mock()
+        mocked_session_cls.return_value = mocked_session
+        mocked_iter_listings.return_value = [
+            sme.ListingRow(
+                listing_id="listing-2",
+                asset_id="asset-2",
+                page=1,
+                price=2.5,
+                currency="1",
+                float_value=0.08,
+                wear="Minimal Wear",
+                paint_seed=9,
+                has_stickers=None,
+                sticker_count=None,
+                inspect_link="steam://inspect2",
+            ),
+            sme.ListingRow(
+                listing_id="listing-3",
+                asset_id="asset-3",
+                page=1,
+                price=3.5,
+                currency="1",
+                float_value=0.09,
+                wear="Minimal Wear",
+                paint_seed=10,
+                has_stickers=True,
+                sticker_count=2,
+                inspect_link="steam://inspect3",
+            ),
+        ]
+
+        temp_dir = make_workspace_temp_dir("run_fetch_sync")
+        existing_output_path = temp_dir / "ak_47_safari_mesh_minimal_wear.xlsx"
+        pd.DataFrame(
+            [
+                {"listing_id": "listing-1", "price": 1.0},
+                {"listing_id": "listing-2", "price": 2.0},
+            ]
+        ).to_excel(existing_output_path, index=False)
+
+        args = argparse.Namespace(
+            market_hash_name="AK-47 | Safari Mesh (Minimal Wear)",
+            output=None,
+            currency=1,
+            country="US",
+            language="english",
+            steam_page_delay=0,
+            steam_max_retries=1,
+        )
+        buffer = io.StringIO()
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            with redirect_stdout(buffer):
+                sme.run_fetch(args)
+
+            synced_dataframe = pd.read_excel(existing_output_path)
+
+        output_text = buffer.getvalue()
+        self.assertEqual(len(synced_dataframe), 2)
+        self.assertEqual(set(synced_dataframe["listing_id"]), {"listing-2", "listing-3"})
+        self.assertIn("Synced 2 current listings", output_text)
+        self.assertIn("added 1, removed 1, unchanged 1", output_text)
+
+    @patch("steam_market_to_excel.fetch_market_dataframe")
+    def test_run_fetch_many_processes_multiple_items(self, mocked_fetch_market_dataframe):
+        mocked_fetch_market_dataframe.side_effect = [
+            pd.DataFrame([{"listing_id": "listing-1", "price": 1.0}]),
+            pd.DataFrame([{"listing_id": "listing-2", "price": 2.0}]),
+        ]
+
+        temp_dir = make_workspace_temp_dir("run_fetch_many")
+        args = argparse.Namespace(
+            market_hash_names=["AK-47 | Redline (Field-Tested)", "M4A1-S | Basilisk (Field-Tested)"],
+            items_file=None,
+            currency=1,
+            country="US",
+            language="english",
+            steam_page_delay=0,
+            steam_max_retries=1,
+            workers=1,
+            min_float=None,
+            max_float=None,
+            min_price=None,
+            max_price=None,
+            wear=None,
+            paint_seed=None,
+            has_stickers=False,
+            no_stickers=False,
+            min_sticker_count=None,
+            max_sticker_count=None,
+            sort_by=None,
+            descending=False,
+            show=False,
+            limit=25,
+            columns=None,
+        )
+        buffer = io.StringIO()
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            with redirect_stdout(buffer):
+                sme.run_fetch_many(args)
+
+        output_text = buffer.getvalue()
+        self.assertTrue((temp_dir / "ak_47_redline_field_tested.xlsx").exists())
+        self.assertTrue((temp_dir / "m4a1_s_basilisk_field_tested.xlsx").exists())
+        self.assertIn("Fetching 2 items with 1 worker(s)...", output_text)
+
     def test_run_sort_creates_sorted_output_file(self):
         dataframe = pd.DataFrame(
             [
@@ -730,6 +1010,14 @@ class TestListingAndExportFlow(unittest.TestCase):
         mocked_run_use.assert_called_once()
         args = mocked_run_use.call_args.args[0]
         self.assertEqual(args.command, "use")
+
+    @patch("steam_market_to_excel.run_fetch_many")
+    def test_main_uses_fetch_many_subcommand(self, mocked_run_fetch_many):
+        sme.main(["fetch-many", "AK-47 | Redline (Field-Tested)"])
+
+        mocked_run_fetch_many.assert_called_once()
+        args = mocked_run_fetch_many.call_args.args[0]
+        self.assertEqual(args.command, "fetch-many")
 
     @patch("steam_market_to_excel.run_show")
     def test_main_uses_show_subcommand(self, mocked_run_show):
