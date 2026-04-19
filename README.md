@@ -1,6 +1,6 @@
-# Steam Market Listing to CLI Tool (CS2)
+# Steam Market Listing Tool (CS2)
 
-A command-line tool for scraping CS2 Steam Community Market listings, saving them to Excel or CSV, and then exploring the saved data from the terminal.
+A CLI and desktop search tool for scraping CS2 Steam Community Market listings, saving them to Excel or CSV, and then exploring the data either from the terminal or from a desktop app.
 
 This is a personal project built to make that workflow faster and less painful.
 
@@ -12,6 +12,7 @@ The project is released under the `MIT` license, so other people can use, modify
 
 ## What the tool can do
 
+- launch a desktop app for building and running search batches with a cleaner, more user-friendly UI
 - `fetch` Steam Community Market listings for a CS2 item and save them to a file
 - `fetch` now reuses a stable per-item file name by default and syncs that file in place
 - `fetch` can now filter, sort, and optionally show matching rows in the same command
@@ -45,8 +46,11 @@ python src/steam_market_to_excel.py "AK-47 | Redline (Field-Tested)"
 ## Current project files
 
 - `src/steam_market_to_excel.py` - the real CLI tool
+- `src/smte_desktop.py` - the desktop app entry point
+- `src/smte_desktop_support.py` - the desktop app's reusable non-UI logic
 - `pyproject.toml` - packaging config that makes the tool installable as a real CLI command
-- `tests/test_steam_market_to_excel.py` - automated tests for the real script
+- `tests/test_steam_market_to_excel.py` - automated tests for the CLI tool
+- `tests/test_smte_desktop_support.py` - automated tests for the desktop app support layer
 
 ## Requirements
 
@@ -79,7 +83,13 @@ After either install, you can run the tool as:
 smte --help
 ```
 
-That installed command is created from the project entry point in `pyproject.toml`.
+The desktop app is also installable:
+
+```bash
+smte-desktop
+```
+
+Those installed commands are created from the project entry points in `pyproject.toml`.
 
 On Windows, a `--user` install usually places `smte.exe` here:
 
@@ -108,6 +118,38 @@ python -m pip install setuptools
 - `fetch-many` can process several market names in parallel and sync one file per item
 - file-based commands can use `latest` as a shortcut for the export file you most recently chose with `use`
 - if you have not chosen one with `use`, `latest` falls back to the newest export in `exports/`
+- the desktop app uses the same scraping/filtering engine as the CLI instead of duplicating the logic
+- desktop autocomplete suggestions are cached locally in `app_data/` so repeated searches do not have to start from scratch every launch
+
+## Desktop app
+
+The project now includes a desktop UI aimed at the workflow where you want to:
+
+- type an item name and get autocomplete suggestions
+- choose one or more wear checkboxes
+- fill in filters like max float, max price, paint seed, and stickers
+- queue several searches
+- run them as a batch
+- view each result set in its own tab with a structured results table
+
+Run the desktop app from an install:
+
+```bash
+smte-desktop
+```
+
+Or directly from the repo:
+
+```bash
+python src/smte_desktop.py
+```
+
+Desktop app notes:
+
+- autocomplete suggestions are fetched from Steam's market search endpoint and then cached locally in `app_data/market_name_autocomplete_cache.json`
+- desktop settings are stored locally in `app_data/desktop_app_settings.json`
+- `app_data/` is ignored by Git so the cache and settings stay local to each machine
+- the desktop app runs searches sequentially by default, which is slower than aggressive batching but safer against Steam rate limits
 
 ## Basic usage
 
@@ -173,6 +215,12 @@ smte stats latest
 smte use exports/redline_filtered.xlsx
 ```
 
+For the desktop flow instead of the terminal flow:
+
+```powershell
+smte-desktop
+```
+
 ## Installable CLI command
 
 The project can now be installed as a proper command-line tool.
@@ -182,6 +230,7 @@ Recommended setup:
 ```bash
 python -m pip install -e .
 smte --help
+smte-desktop
 ```
 
 If you prefer a normal non-editable install:
@@ -189,6 +238,7 @@ If you prefer a normal non-editable install:
 ```bash
 python -m pip install .
 smte --help
+smte-desktop
 ```
 
 ## CLI commands

@@ -16,9 +16,10 @@ dependencies = [
 
 [project.scripts]
 smte = "steam_market_to_excel:main"
+smte-desktop = "smte_desktop:main"
 
 [tool.setuptools]
-py-modules = ["steam_market_to_excel"]
+py-modules = ["steam_market_to_excel", "smte_desktop", "smte_desktop_support"]
 
 [tool.setuptools.package-dir]
 "" = "src"

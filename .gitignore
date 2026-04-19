@@ -20,6 +20,7 @@ out/
 exports/
 local_explanations/
 local_presets/
+app_data/
 tests/_tmp_runtime/
 tmp*/
 *.xlsx

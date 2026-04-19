@@ -265,7 +265,11 @@ class TestBasicHelpers(unittest.TestCase):
         )
         self.assertEqual(
             pyproject_data["tool"]["setuptools"]["py-modules"],
-            ["steam_market_to_excel"],
+            ["steam_market_to_excel", "smte_desktop", "smte_desktop_support"],
+        )
+        self.assertEqual(
+            pyproject_data["project"]["scripts"]["smte-desktop"],
+            "smte_desktop:main",
         )
 
     def test_license_file_exists_and_mentions_mit(self):
