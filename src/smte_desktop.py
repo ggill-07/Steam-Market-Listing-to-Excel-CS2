@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional
 
@@ -23,7 +25,9 @@ from smte_desktop_support import (
     create_query_from_form,
     execute_desktop_query,
     load_desktop_settings,
+    load_desktop_query_queue,
     save_desktop_settings,
+    save_desktop_query_queue,
 )
 
 SORT_OPTIONS = ["price", "float", "paint_seed", "sticker_count", "page"]
@@ -36,6 +40,16 @@ TEXT_MUTED = "#5c6a62"
 TABLE_ALT_ROW = "#f7f1e7"
 
 
+def get_resource_path(*parts: str) -> Path:
+    """Resolve asset paths for both source runs and frozen desktop builds."""
+
+    if getattr(sys, "frozen", False):
+        base_path = Path(getattr(sys, "_MEIPASS", Path.cwd()))
+    else:
+        base_path = Path(__file__).resolve().parents[1]
+    return base_path.joinpath(*parts)
+
+
 class SMTEDesktopApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -43,10 +57,13 @@ class SMTEDesktopApp:
         self.root.geometry("1580x980")
         self.root.minsize(1320, 840)
         self.root.configure(background=APP_BACKGROUND)
+        self.icon_image: Optional[tk.PhotoImage] = None
+        self._apply_window_icon()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.settings = load_desktop_settings()
         self.autocomplete_cache = MarketAutocompleteCache()
-        self.query_items: List[DesktopQuery] = []
+        self.query_items: List[DesktopQuery] = load_desktop_query_queue()
         self.current_suggestions: List[MarketSuggestion] = []
         self.worker_thread: Optional[threading.Thread] = None
         self.worker_events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -59,6 +76,32 @@ class SMTEDesktopApp:
         self._bind_events()
         self._poll_worker_events()
         self._refresh_query_tree()
+        if self.query_items:
+            restored_message = (
+                f"Restored {len(self.query_items)} queued search"
+                f"{'es' if len(self.query_items) != 1 else ''} from the last session."
+            )
+            self.status_var.set(restored_message)
+            self._append_log(restored_message)
+
+    def _apply_window_icon(self) -> None:
+        """Prefer the custom SMTE icon instead of the generic Python one."""
+
+        icon_png_path = get_resource_path("assets", "smte_desktop_icon.png")
+        icon_ico_path = get_resource_path("assets", "smte_desktop_icon.ico")
+
+        try:
+            if icon_png_path.exists():
+                self.icon_image = tk.PhotoImage(file=str(icon_png_path))
+                self.root.iconphoto(True, self.icon_image)
+        except tk.TclError:
+            self.icon_image = None
+
+        try:
+            if icon_ico_path.exists():
+                self.root.iconbitmap(default=str(icon_ico_path))
+        except tk.TclError:
+            pass
 
     def _build_variables(self) -> None:
         self.item_name_var = tk.StringVar()
@@ -339,7 +382,7 @@ class SMTEDesktopApp:
         ttk.Button(actions_frame, text="Clear Queue", style="Secondary.TButton", command=self._clear_query_queue).grid(row=0, column=3, sticky="ew", padx=(0, 8))
         ttk.Button(actions_frame, text="Run Selected", style="Primary.TButton", command=lambda: self._start_run(selected_only=True)).grid(row=0, column=4, sticky="ew", padx=(0, 8))
         ttk.Button(actions_frame, text="Run All", style="Primary.TButton", command=lambda: self._start_run(selected_only=False)).grid(row=0, column=5, sticky="ew", padx=(0, 8))
-        ttk.Button(actions_frame, text="Save Settings", style="Secondary.TButton", command=self._save_settings_from_ui).grid(row=0, column=6, sticky="ew")
+        ttk.Button(actions_frame, text="Save App State", style="Secondary.TButton", command=self._save_app_state_from_ui).grid(row=0, column=6, sticky="ew")
 
         queue_frame = ttk.LabelFrame(builder_frame, text=" Queued Searches ", padding=8, style="Card.TLabelframe")
         queue_frame.grid(row=4, column=0, columnspan=5, sticky="nsew", pady=(12, 0))
@@ -389,7 +432,12 @@ class SMTEDesktopApp:
         self.query_tree.grid(row=1, column=0, columnspan=2, sticky="nsew")
         query_scrollbar = ttk.Scrollbar(queue_frame, orient="vertical", command=self.query_tree.yview)
         query_scrollbar.grid(row=1, column=2, sticky="ns")
-        self.query_tree.configure(yscrollcommand=query_scrollbar.set)
+        query_x_scrollbar = ttk.Scrollbar(queue_frame, orient="horizontal", command=self.query_tree.xview)
+        query_x_scrollbar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.query_tree.configure(
+            yscrollcommand=query_scrollbar.set,
+            xscrollcommand=query_x_scrollbar.set,
+        )
 
         results_frame = ttk.LabelFrame(outer, text=" Results and Activity ", padding=12, style="Card.TLabelframe")
         results_frame.grid(row=3, column=0, sticky="nsew")
@@ -711,6 +759,7 @@ class SMTEDesktopApp:
 
         self.query_items.extend(new_queries)
         self._refresh_query_tree()
+        self._persist_query_queue()
         self._append_log(f"Added {len(new_queries)} queued quer{'y' if len(new_queries) == 1 else 'ies'}.")
 
     def _populate_editor_from_selected_query(self) -> None:
@@ -742,6 +791,7 @@ class SMTEDesktopApp:
         for index in selected_indices:
             del self.query_items[index]
         self._refresh_query_tree()
+        self._persist_query_queue()
         self._append_log(f"Removed {len(selected_indices)} queued quer{'y' if len(selected_indices) == 1 else 'ies'}.")
 
     def _clear_query_queue(self) -> None:
@@ -749,6 +799,7 @@ class SMTEDesktopApp:
             return
         self.query_items.clear()
         self._refresh_query_tree()
+        self._persist_query_queue()
         self._append_log("Cleared the queued query list.")
 
     def _refresh_query_tree(self) -> None:
@@ -826,6 +877,31 @@ class SMTEDesktopApp:
         self._append_log("Saved desktop settings.")
         self.status_var.set("Settings saved.")
 
+    def _save_app_state_from_ui(self) -> None:
+        try:
+            self.settings = self._collect_runtime_settings()
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc), parent=self.root)
+            return
+
+        save_desktop_settings(self.settings)
+        save_desktop_query_queue(self.query_items)
+        self._append_log("Saved desktop settings and queued searches.")
+        self.status_var.set("App state saved.")
+
+    def _persist_query_queue(self) -> None:
+        save_desktop_query_queue(self.query_items)
+
+    def _on_close(self) -> None:
+        try:
+            self.settings = self._collect_runtime_settings()
+            save_desktop_settings(self.settings)
+        except ValueError:
+            pass
+
+        self._persist_query_queue()
+        self.root.destroy()
+
     def _start_run(self, *, selected_only: bool) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Already running", "A batch is already running right now.", parent=self.root)
@@ -849,6 +925,7 @@ class SMTEDesktopApp:
 
         self.settings = settings
         save_desktop_settings(settings)
+        self._persist_query_queue()
         self.status_var.set(f"Running {len(queries_to_run)} queued quer{'y' if len(queries_to_run) == 1 else 'ies'}...")
         self._append_log(self.status_var.get())
 

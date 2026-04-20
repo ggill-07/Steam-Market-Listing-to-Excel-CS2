@@ -110,6 +110,7 @@ python -m pip install setuptools
 - Steam listing pages are requested directly from the market render endpoint
 - the scraper requests up to `100` listings per Steam page
 - float, paint seed, sticker presence, sticker count, and inspect-link data are read from Steam asset data when Steam includes them
+- the tool accepts user-friendly `StatTrack` or `StatTrak` prefixes and normalizes them to Steam's real `StatTrak™` market name format
 - temporary Steam failures like `429`, `500`, `502`, `503`, and `504` are retried automatically
 - plain output filenames are saved into the `exports/` folder by default
 - if `fetch` is run without `-o`, it derives a stable filename from the item name, such as `ak_47_redline_field_tested.xlsx`
@@ -148,6 +149,8 @@ Desktop app notes:
 
 - autocomplete suggestions are fetched from Steam's market search endpoint and then cached locally in `app_data/market_name_autocomplete_cache.json`
 - desktop settings are stored locally in `app_data/desktop_app_settings.json`
+- queued searches are restored automatically from `app_data/desktop_query_queue.json` when you relaunch the desktop app
+- the `Save App State` button saves both the current desktop settings and the queued searches immediately
 - `app_data/` is ignored by Git so the cache and settings stay local to each machine
 - the desktop app runs searches sequentially by default, which is slower than aggressive batching but safer against Steam rate limits
 
@@ -454,7 +457,7 @@ The current test suite covers:
 - stable per-item fetch output naming and in-place sync summaries
 - inline fetch filtering, sorting, and terminal display
 - packaging metadata for the installable `smte` command
-- Windows `.exe` build script wiring
+- Windows `.exe` build script wiring for both the CLI and the desktop app
 
 ## Windows `.exe` build
 
@@ -495,6 +498,55 @@ And you would run it like:
 ```
 
 If you rebuild often, make sure an older copy of `dist\smte.exe` is not currently open before rebuilding. The build script now retries removal of the previous output first, and if the file is still locked it will tell you to close it or choose a different `-Name`.
+
+## Windows desktop app build
+
+If you want the desktop UI to feel like a normal Windows app you can click from a shortcut, build the desktop executable instead of the CLI executable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_desktop_exe.ps1
+```
+
+That builds:
+
+```text
+dist\smte-desktop.exe
+```
+
+The desktop build is:
+
+- windowed, so it opens like a normal app instead of showing a console window
+- bundled with the custom SMTE icon
+- bundled with the icon assets the app uses at runtime
+
+You can test the desktop executable by launching it directly:
+
+```powershell
+.\dist\smte-desktop.exe
+```
+
+You can also choose a custom executable name:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_desktop_exe.ps1 -Name SMTE-Desktop-App
+```
+
+That would build:
+
+```text
+dist\SMTE-Desktop-App.exe
+```
+
+### Create a real desktop shortcut
+
+Once the desktop executable exists, the easiest Windows workflow is:
+
+1. Open the `dist\` folder.
+2. Right-click `smte-desktop.exe`.
+3. Choose `Send to > Desktop (create shortcut)`.
+4. Rename the shortcut to something friendly like `SMTE Desktop`.
+
+After that, you can launch the app the same way you launch other desktop programs: just double-click the shortcut.
 
 ## Notes
 

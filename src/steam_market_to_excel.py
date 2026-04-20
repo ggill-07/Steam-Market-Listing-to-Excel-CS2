@@ -39,6 +39,10 @@ SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 CLI_COMMANDS = {"fetch", "fetch-many", "sort", "filter", "stats", "show", "use"}
 DEFAULT_FETCH_MANY_WORKERS = 3
 RIGHT_ALIGN_COLUMNS = {"page", "float", "price", "paint_seed", "sticker_count"}
+STATTRAK_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:stattrak|stattrack)(?:\u2122)?\s+",
+    re.IGNORECASE,
+)
 DEFAULT_SHOW_COLUMNS = [
     "page",
     "float",
@@ -85,6 +89,17 @@ def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
     if float_value < 0.45:
         return "Well-Worn"
     return "Battle-Scarred"
+
+
+def normalize_market_hash_name_input(market_hash_name: str) -> str:
+    normalized_name = market_hash_name.strip()
+    if STATTRAK_PREFIX_PATTERN.match(normalized_name):
+        normalized_name = STATTRAK_PREFIX_PATTERN.sub(
+            "StatTrak\u2122 ",
+            normalized_name,
+            count=1,
+        )
+    return normalized_name
 
 
 def coerce_float(value: Any) -> Optional[float]:
@@ -172,6 +187,7 @@ def steam_render_page(
     language: str,
     max_retries: int = DEFAULT_STEAM_RETRIES,
 ) -> Dict[str, Any]:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
     encoded_name = quote(market_hash_name, safe="")
     url = f"https://steamcommunity.com/market/listings/{STEAM_APP_ID}/{encoded_name}/render/"
     params = {
@@ -190,6 +206,16 @@ def steam_render_page(
             response.raise_for_status()
             payload = response.json()
             if not payload.get("success", False):
+                # Steam sometimes answers late pages with success=false once the
+                # market count has shifted underneath us. For non-first pages,
+                # treat an empty payload as "we reached the end" instead of a
+                # hard failure.
+                if (
+                    start > 0
+                    and int(payload.get("total_count", 0) or 0) == 0
+                    and not payload.get("listinginfo")
+                ):
+                    return payload
                 raise RuntimeError(
                     f"Steam render endpoint returned unsuccessful response for start={start}"
                 )
@@ -325,6 +351,7 @@ def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
 
 
 def slugify_market_hash_name(market_hash_name: str) -> str:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
     slug = re.sub(r"[^a-z0-9]+", "_", market_hash_name.lower()).strip("_")
     return slug or "steam_listings"
 
@@ -713,6 +740,7 @@ def build_fetch_result_summary(result: FetchResult) -> str:
 
 
 def fetch_market_dataframe(args: argparse.Namespace, market_hash_name: str) -> pd.DataFrame:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
     session = create_requests_session()
     rows = list(
         iter_listings(
@@ -734,6 +762,7 @@ def sync_market_dataframe(
     output_name: Optional[str] = None,
     update_latest: bool = True,
 ) -> FetchResult:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
     resolved_output_name = output_name or default_fetch_output_name(market_hash_name)
     output_path = resolve_output_path(resolved_output_name)
     previous_dataframe = load_table(str(output_path)) if output_path.exists() else None
@@ -1152,6 +1181,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def run_fetch(args: argparse.Namespace) -> None:
+    args.market_hash_name = normalize_market_hash_name_input(args.market_hash_name)
     dataframe = fetch_market_dataframe(args, args.market_hash_name)
     result = sync_market_dataframe(
         dataframe=dataframe,
@@ -1169,12 +1199,15 @@ def run_fetch(args: argparse.Namespace) -> None:
 
 
 def collect_market_hash_names(args: argparse.Namespace) -> List[str]:
-    market_hash_names = list(args.market_hash_names or [])
+    market_hash_names = [
+        normalize_market_hash_name_input(market_hash_name)
+        for market_hash_name in list(args.market_hash_names or [])
+    ]
 
     if args.items_file:
         items_file_path = Path(args.items_file)
         file_market_hash_names = [
-            line.strip()
+            normalize_market_hash_name_input(line.strip())
             for line in items_file_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]

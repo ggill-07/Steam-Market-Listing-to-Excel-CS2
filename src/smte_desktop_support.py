@@ -14,6 +14,7 @@ import steam_market_to_excel as sme
 APP_DATA_DIR = Path("app_data")
 AUTOCOMPLETE_CACHE_PATH = APP_DATA_DIR / "market_name_autocomplete_cache.json"
 DESKTOP_SETTINGS_PATH = APP_DATA_DIR / "desktop_app_settings.json"
+DESKTOP_QUERY_QUEUE_PATH = APP_DATA_DIR / "desktop_query_queue.json"
 AUTOCOMPLETE_MIN_CHARS = 2
 AUTOCOMPLETE_PAGE_SIZE = 25
 WEAR_OPTIONS = [
@@ -76,6 +77,7 @@ def ensure_app_data_dir() -> Path:
 
 
 def strip_wear_suffix(market_hash_name: str) -> str:
+    market_hash_name = sme.normalize_market_hash_name_input(market_hash_name)
     for wear_name in WEAR_OPTIONS:
         suffix = f" ({wear_name})"
         if market_hash_name.endswith(suffix):
@@ -257,6 +259,7 @@ class MarketAutocompleteCache:
 
     def fetch_and_cache_suggestions(self, query_text: str) -> List[MarketSuggestion]:
         normalized_query = query_text.strip()
+        normalized_query = sme.normalize_market_hash_name_input(normalized_query)
         if len(normalized_query) < AUTOCOMPLETE_MIN_CHARS:
             return []
 
@@ -336,3 +339,42 @@ def save_desktop_settings(settings: DesktopSettings, settings_path: Path = DESKT
     ensure_app_data_dir()
     settings_path.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
     return settings_path
+
+
+def load_desktop_query_queue(queue_path: Path = DESKTOP_QUERY_QUEUE_PATH) -> List[DesktopQuery]:
+    if not queue_path.exists():
+        return []
+    try:
+        raw_items = json.loads(queue_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if not isinstance(raw_items, list):
+        return []
+
+    valid_fields = {field.name for field in DesktopQuery.__dataclass_fields__.values()}
+    queries: List[DesktopQuery] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        filtered_item = {key: value for key, value in raw_item.items() if key in valid_fields}
+        try:
+            query = DesktopQuery(**filtered_item)
+        except TypeError:
+            continue
+        if not query.sort_by:
+            query.sort_by = ["price"]
+        queries.append(query)
+    return queries
+
+
+def save_desktop_query_queue(
+    queries: List[DesktopQuery],
+    queue_path: Path = DESKTOP_QUERY_QUEUE_PATH,
+) -> Path:
+    ensure_app_data_dir()
+    queue_path.write_text(
+        json.dumps([asdict(query) for query in queries], indent=2),
+        encoding="utf-8",
+    )
+    return queue_path

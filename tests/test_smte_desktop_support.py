@@ -53,6 +53,12 @@ class TestDesktopSupportHelpers(unittest.TestCase):
             "AK-47 | Safari Mesh (Minimal Wear)",
         )
 
+    def test_build_market_hash_name_normalizes_stattrak_alias(self):
+        self.assertEqual(
+            sds.build_market_hash_name("StatTrack AK-47 | Redline", "Field-Tested"),
+            "StatTrak\u2122 AK-47 | Redline (Field-Tested)",
+        )
+
     def test_create_query_from_form_parses_values(self):
         result = sds.create_query_from_form(
             base_name="AK-47 | Safari Mesh",
@@ -79,6 +85,24 @@ class TestDesktopSupportHelpers(unittest.TestCase):
         self.assertEqual(result.max_sticker_count, 4)
         self.assertEqual(result.sort_by, ["price"])
         self.assertEqual(result.limit, 150)
+
+    def test_create_query_from_form_normalizes_stattrak_alias(self):
+        result = sds.create_query_from_form(
+            base_name="StatTrack AK-47 | Redline",
+            wear_name="Field-Tested",
+            max_float_text="",
+            max_price_text="",
+            paint_seed_text="",
+            has_stickers=False,
+            no_stickers=False,
+            min_sticker_count_text="",
+            max_sticker_count_text="",
+            sort_by=["price"],
+            descending=False,
+            limit_text="100",
+        )
+
+        self.assertEqual(result.base_name, "StatTrak\u2122 AK-47 | Redline")
 
     def test_create_query_from_form_rejects_conflicting_sticker_modes(self):
         with self.assertRaisesRegex(ValueError, "either has stickers or no stickers"):
@@ -132,6 +156,40 @@ class TestDesktopSupportHelpers(unittest.TestCase):
         self.assertEqual(loaded.steam_max_retries, 7)
         self.assertEqual(loaded.pause_between_queries, 4.5)
         self.assertFalse(loaded.continue_on_error)
+
+    def test_save_and_load_desktop_query_queue_round_trip(self):
+        temp_dir = make_workspace_temp_dir("desktop_query_queue")
+        queue_path = temp_dir / "desktop_query_queue.json"
+        original_queries = [
+            sds.DesktopQuery(
+                base_name="AK-47 | Safari Mesh",
+                wear="Minimal Wear",
+                max_float=0.11,
+                sort_by=["price"],
+                limit=1000,
+            ),
+            sds.DesktopQuery(
+                base_name="MP5-SD | Neon Squeezer",
+                wear="Field-Tested",
+                max_float=0.26,
+                max_price=2.5,
+                sort_by=["price"],
+                descending=True,
+                limit=500,
+            ),
+        ]
+
+        sds.save_desktop_query_queue(original_queries, queue_path=queue_path)
+        loaded_queries = sds.load_desktop_query_queue(queue_path=queue_path)
+
+        self.assertEqual(len(loaded_queries), 2)
+        self.assertEqual(loaded_queries[0].base_name, "AK-47 | Safari Mesh")
+        self.assertEqual(loaded_queries[0].wear, "Minimal Wear")
+        self.assertEqual(loaded_queries[0].max_float, 0.11)
+        self.assertEqual(loaded_queries[1].base_name, "MP5-SD | Neon Squeezer")
+        self.assertEqual(loaded_queries[1].wear, "Field-Tested")
+        self.assertEqual(loaded_queries[1].max_price, 2.5)
+        self.assertTrue(loaded_queries[1].descending)
 
 
 class TestAutocompleteCache(unittest.TestCase):
@@ -226,6 +284,13 @@ class TestDesktopQueryExecution(unittest.TestCase):
 class TestDesktopAppModule(unittest.TestCase):
     def test_desktop_entry_point_is_exposed(self):
         self.assertTrue(callable(smte_desktop.main))
+
+    def test_desktop_icon_assets_exist(self):
+        png_path = smte_desktop.get_resource_path("assets", "smte_desktop_icon.png")
+        ico_path = smte_desktop.get_resource_path("assets", "smte_desktop_icon.ico")
+
+        self.assertTrue(png_path.exists())
+        self.assertTrue(ico_path.exists())
 
 
 if __name__ == "__main__":

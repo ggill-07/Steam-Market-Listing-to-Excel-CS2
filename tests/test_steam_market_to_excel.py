@@ -132,6 +132,20 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.default_fetch_output_name("AK-47 | Safari Mesh (Minimal Wear)")
         self.assertEqual(result, "ak_47_safari_mesh_minimal_wear.xlsx")
 
+    def test_normalize_market_hash_name_input_supports_stattrak_aliases(self):
+        self.assertEqual(
+            sme.normalize_market_hash_name_input("StatTrack AK-47 | Redline (Field-Tested)"),
+            "StatTrak\u2122 AK-47 | Redline (Field-Tested)",
+        )
+        self.assertEqual(
+            sme.normalize_market_hash_name_input("StatTrak AK-47 | Redline (Field-Tested)"),
+            "StatTrak\u2122 AK-47 | Redline (Field-Tested)",
+        )
+
+    def test_default_fetch_output_name_normalizes_stattrak_alias(self):
+        result = sme.default_fetch_output_name("StatTrack AK-47 | Redline (Field-Tested)")
+        self.assertEqual(result, "stattrak_ak_47_redline_field_tested.xlsx")
+
     def test_resolve_output_path_keeps_custom_folder_paths(self):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
         self.assertEqual(result, Path("custom_folder") / "result.xlsx")
@@ -293,6 +307,20 @@ class TestBasicHelpers(unittest.TestCase):
         self.assertIn("src\\steam_market_to_excel.py", script_text)
         self.assertIn('$distDir = Join-Path $repoRoot "dist"', script_text)
 
+    def test_windows_desktop_exe_build_script_exists_and_targets_desktop_app(self):
+        build_script_path = PROJECT_ROOT / "scripts" / "build_windows_desktop_exe.ps1"
+        script_text = build_script_path.read_text(encoding="utf-8")
+
+        self.assertIn("python -m PyInstaller", script_text)
+        self.assertIn("--onefile", script_text)
+        self.assertIn("--windowed", script_text)
+        self.assertIn("--icon $iconIco", script_text)
+        self.assertIn('--add-data "${iconIco};assets"', script_text)
+        self.assertIn('--add-data "${iconPng};assets"', script_text)
+        self.assertIn("src\\smte_desktop.py", script_text)
+        self.assertIn('assets\\smte_desktop_icon.ico', script_text)
+        self.assertIn('assets\\smte_desktop_icon.png', script_text)
+
 
 class TestFakeApiResponses(unittest.TestCase):
     """Tests that use fake responses instead of real HTTP requests."""
@@ -358,6 +386,59 @@ class TestFakeApiResponses(unittest.TestCase):
         self.assertEqual(payload["total_count"], 0)
         self.assertEqual(fake_session.get.call_count, 2)
         mocked_sleep.assert_called_once_with(5)
+
+    def test_steam_render_page_accepts_unsuccessful_empty_later_page(self):
+        empty_later_page_response = Mock(status_code=200, headers={})
+        empty_later_page_response.raise_for_status = Mock()
+        empty_later_page_response.json.return_value = {
+            "success": False,
+            "start": 9000,
+            "pagesize": 100,
+            "total_count": 0,
+            "listinginfo": {},
+            "results_html": "<div class=\"market_listing_table_header\"></div>",
+        }
+
+        fake_session = Mock()
+        fake_session.get.return_value = empty_later_page_response
+
+        payload = sme.steam_render_page(
+            session=fake_session,
+            market_hash_name="MP5-SD | Neon Squeezer (Field-Tested)",
+            start=9000,
+            currency=1,
+            country="US",
+            language="english",
+            max_retries=2,
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["start"], 9000)
+
+    def test_steam_render_page_still_errors_on_unsuccessful_first_page(self):
+        unsuccessful_first_page_response = Mock(status_code=200, headers={})
+        unsuccessful_first_page_response.raise_for_status = Mock()
+        unsuccessful_first_page_response.json.return_value = {
+            "success": False,
+            "start": 0,
+            "pagesize": 100,
+            "total_count": 0,
+            "listinginfo": {},
+        }
+
+        fake_session = Mock()
+        fake_session.get.return_value = unsuccessful_first_page_response
+
+        with self.assertRaisesRegex(RuntimeError, "unsuccessful response for start=0"):
+            sme.steam_render_page(
+                session=fake_session,
+                market_hash_name="MP5-SD | Neon Squeezer (Field-Tested)",
+                start=0,
+                currency=1,
+                country="US",
+                language="english",
+                max_retries=2,
+            )
 
     def test_extract_steam_metadata_reads_asset_properties(self):
         asset_payload = {
