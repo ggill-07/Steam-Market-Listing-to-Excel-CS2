@@ -112,6 +112,7 @@ python -m pip install setuptools
 - float, paint seed, sticker presence, sticker count, and inspect-link data are read from Steam asset data when Steam includes them
 - the tool accepts user-friendly `StatTrack` or `StatTrak` prefixes and normalizes them to Steam's real `StatTrak™` market name format
 - temporary Steam failures like `429`, `500`, `502`, `503`, and `504` are retried automatically
+- long crawls now refresh the HTTP session every `10` listing pages and use extended cooldown recovery if Steam keeps rate-limiting a deep page
 - plain output filenames are saved into the `exports/` folder by default
 - if `fetch` is run without `-o`, it derives a stable filename from the item name, such as `ak_47_redline_field_tested.xlsx`
 - fetching the same item again updates that same file in place and reports how many listings were added, removed, or stayed the same
@@ -273,7 +274,7 @@ Useful options:
 - `--currency` - Steam currency ID, default `1` for USD
 - `--country` - Steam country code, default `US`
 - `--language` - Steam language, default `english`
-- `--steam-page-delay` - seconds to wait between Steam page requests, default `0.0`
+- `--steam-page-delay` - seconds to wait between Steam page requests, default `0.5`
 - `--steam-max-retries` - retry count for temporary Steam errors, default `5`
 - `-o/--output` - plain filenames go into `exports/`; custom paths are respected
 - `--min-float` / `--max-float`
@@ -312,7 +313,7 @@ Useful options:
 
 - `--items-file` - text file with one exact Steam market name per line
 - `--workers` - how many items to fetch in parallel, default `3`
-- `--steam-page-delay` - delay inside each worker, default `0.0`
+- `--steam-page-delay` - delay inside each worker, default `0.5`
 - all the same inline filter/sort/show options supported by `fetch`
 
 ### `show`
@@ -423,17 +424,21 @@ This works with:
 
 ## Speed notes
 
-This branch now defaults to a much faster fetch configuration than before:
+The current fetch logic aims for stability first on very large markets:
 
-- `fetch` uses a default Steam page delay of `0.0`
+- `fetch` uses a default Steam page delay of `0.5`
 - `fetch-many` uses `3` workers by default
+- the scraper refreshes the HTTP session every `10` listing pages
+- if Steam still keeps rejecting a deep page, the scraper enters a longer cooldown-and-retry recovery path automatically
 
 In live probes during development on this branch:
 
-- `20` straight market page requests at `0.0` delay completed successfully in one session
-- `3` items fetched in parallel with `3` workers also completed successfully in a small parallel probe
+- `0.0` delay hit a `429` around the 30th straight page request in one MP5 probe
+- rebuilding the session between pages removed that immediate failure pattern
+- the updated recovery logic completed a real full run of `MP5-SD | Neon Squeezer (Field-Tested)` after deep-page 429s near the end of the crawl
+- the updated logic also completed a real run of `MP5-SD | Savannah Halftone (Field-Tested)` cleanly
 
-That does not guarantee Steam will always allow the same speed forever, so if you start seeing more `429` or `502` responses, the first things to try are:
+Steam can still be inconsistent from one session to the next, so if you start seeing more `429` or `502` responses, the first things to try are:
 
 - increase `--steam-page-delay` to `0.10` or `0.25`
 - reduce `--workers` to `2` or `1`

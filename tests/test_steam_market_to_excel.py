@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
+import requests
 
 
 # Make sure Python can import the file from the src/ folder.
@@ -149,6 +150,12 @@ class TestBasicHelpers(unittest.TestCase):
     def test_resolve_output_path_keeps_custom_folder_paths(self):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
         self.assertEqual(result, Path("custom_folder") / "result.xlsx")
+
+    def test_should_refresh_steam_session_every_ten_pages(self):
+        self.assertFalse(sme.should_refresh_steam_session(0))
+        self.assertFalse(sme.should_refresh_steam_session(9))
+        self.assertTrue(sme.should_refresh_steam_session(10))
+        self.assertTrue(sme.should_refresh_steam_session(20))
 
     def test_resolve_input_path_supports_latest_keyword(self):
         temp_dir = make_workspace_temp_dir("resolve_latest")
@@ -440,6 +447,131 @@ class TestFakeApiResponses(unittest.TestCase):
                 max_retries=2,
             )
 
+    @patch("steam_market_to_excel.time.sleep")
+    @patch("steam_market_to_excel.create_requests_session")
+    def test_recover_steam_render_page_refreshes_session_and_returns_payload(
+        self,
+        mocked_create_requests_session,
+        mocked_sleep,
+    ):
+        original_session = Mock()
+        refreshed_session = Mock()
+        mocked_create_requests_session.return_value = refreshed_session
+        expected_payload = {"success": True, "total_count": 100, "listinginfo": {"1": {}}}
+
+        with patch(
+            "steam_market_to_excel.steam_render_page",
+            return_value=expected_payload,
+        ) as mocked_steam_render_page:
+            payload, returned_session, adjusted_delay = sme.recover_steam_render_page(
+                session=original_session,
+                market_hash_name="MP5-SD | Neon Squeezer (Field-Tested)",
+                start=6800,
+                currency=1,
+                country="US",
+                language="english",
+                max_retries=5,
+                steam_page_delay=0.0,
+            )
+
+        self.assertEqual(payload, expected_payload)
+        self.assertIs(returned_session, refreshed_session)
+        self.assertEqual(adjusted_delay, sme.STEAM_RECOVERY_PAGE_DELAY_FLOOR)
+        mocked_sleep.assert_called_once_with(sme.STEAM_RECOVERY_WAIT_STEPS[0])
+        mocked_steam_render_page.assert_called_once()
+
+    @patch("steam_market_to_excel.time.sleep")
+    @patch("steam_market_to_excel.create_requests_session")
+    def test_recover_steam_render_page_raises_after_all_recovery_rounds(
+        self,
+        mocked_create_requests_session,
+        mocked_sleep,
+    ):
+        refreshed_session = Mock()
+        refreshed_session.close = Mock()
+        mocked_create_requests_session.return_value = refreshed_session
+        http_error = requests.HTTPError("still rate limited", response=Mock(status_code=429))
+
+        with patch(
+            "steam_market_to_excel.steam_render_page",
+            side_effect=http_error,
+        ):
+            with self.assertRaisesRegex(requests.HTTPError, "extended recovery"):
+                sme.recover_steam_render_page(
+                    session=Mock(),
+                    market_hash_name="MP5-SD | Neon Squeezer (Field-Tested)",
+                    start=6800,
+                    currency=1,
+                    country="US",
+                    language="english",
+                    max_retries=5,
+                    steam_page_delay=0.0,
+                )
+
+        self.assertEqual(mocked_sleep.call_count, len(sme.STEAM_RECOVERY_WAIT_STEPS))
+
+    @patch("steam_market_to_excel.time.sleep")
+    @patch("steam_market_to_excel.recover_steam_render_page")
+    def test_iter_listings_recovers_after_temporary_http_error(
+        self,
+        mocked_recover_steam_render_page,
+        mocked_sleep,
+    ):
+        fake_payload = {
+            "total_count": 1,
+            "listinginfo": {
+                "12345": {
+                    "asset": {"id": "67890"},
+                    "converted_price": 123,
+                    "converted_fee": 22,
+                    "currencyid": 1,
+                }
+            },
+            "assets": {
+                "730": {
+                    "2": {
+                        "67890": {
+                            "market_actions": [{"link": "steam://rungame/730/%listingid%/%assetid%"}],
+                            "asset_properties": [
+                                {"propertyid": 2, "float_value": 0.091},
+                                {"propertyid": 1, "int_value": 777},
+                            ],
+                            "descriptions": [{"value": "Sticker: Test"}],
+                        }
+                    }
+                }
+            },
+        }
+        fake_session = Mock()
+        temporary_error = requests.HTTPError("rate limited", response=Mock(status_code=429))
+
+        with patch(
+            "steam_market_to_excel.steam_render_page",
+            side_effect=[temporary_error],
+        ):
+            mocked_recover_steam_render_page.return_value = (
+                fake_payload,
+                fake_session,
+                1.0,
+            )
+            rows = list(
+                sme.iter_listings(
+                    session=fake_session,
+                    market_hash_name="AK-47 | Safari Mesh (Minimal Wear)",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_page_delay=0.0,
+                    steam_max_retries=5,
+                )
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].listing_id, "12345")
+        self.assertEqual(rows[0].wear, "Minimal Wear")
+        mocked_recover_steam_render_page.assert_called_once()
+        mocked_sleep.assert_called_once_with(1.0)
+
     def test_extract_steam_metadata_reads_asset_properties(self):
         asset_payload = {
             "asset_properties": [
@@ -662,22 +794,29 @@ class TestListingAndExportFlow(unittest.TestCase):
 
         self.assertEqual(
             list(display_dataframe.columns),
-            ["page", "float", "price", "stickers", "wear", "paint_seed", "listing_id"],
+            ["#", "page", "float", "price", "stickers", "wear", "paint_seed", "listing_id"],
         )
+        self.assertEqual(display_dataframe.iloc[0]["#"], 1)
         self.assertEqual(display_dataframe.iloc[0]["float"], "0.123457")
         self.assertEqual(display_dataframe.iloc[0]["price"], "2.00")
         self.assertEqual(display_dataframe.iloc[0]["stickers"], "yes")
 
     def test_format_terminal_table_draws_a_readable_grid(self):
-        display_dataframe = pd.DataFrame(
+        source_dataframe = pd.DataFrame(
             [
                 {"page": "1", "float": "0.123456", "price": "2.00", "wear": "Minimal Wear"},
                 {"page": "2", "float": "0.200000", "price": "3.50", "wear": "Field-Tested"},
             ]
         )
+        display_dataframe = sme.build_show_dataframe(
+            source_dataframe,
+            columns=["page", "float", "price", "wear"],
+            limit=None,
+        )
 
         table_text = sme.format_terminal_table(display_dataframe)
 
+        self.assertIn("#", table_text)
         self.assertIn("page", table_text)
         self.assertIn("Minimal Wear", table_text)
         self.assertIn("-+-", table_text)

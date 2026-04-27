@@ -29,7 +29,7 @@ import requests
 STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
 PAGE_SIZE = 100
-DEFAULT_STEAM_PAGE_DELAY = 0.0
+DEFAULT_STEAM_PAGE_DELAY = 0.5
 DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -38,7 +38,10 @@ LATEST_POINTER_FILENAME = ".latest_export.txt"
 SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 CLI_COMMANDS = {"fetch", "fetch-many", "sort", "filter", "stats", "show", "use"}
 DEFAULT_FETCH_MANY_WORKERS = 3
-RIGHT_ALIGN_COLUMNS = {"page", "float", "price", "paint_seed", "sticker_count"}
+RIGHT_ALIGN_COLUMNS = {"#", "page", "float", "price", "paint_seed", "sticker_count"}
+STEAM_SESSION_REFRESH_PAGE_INTERVAL = 10
+STEAM_RECOVERY_WAIT_STEPS = (30.0, 60.0, 120.0)
+STEAM_RECOVERY_PAGE_DELAY_FLOOR = 1.0
 STATTRAK_PREFIX_PATTERN = re.compile(
     r"^\s*(?:stattrak|stattrack)(?:\u2122)?\s+",
     re.IGNORECASE,
@@ -270,63 +273,94 @@ def iter_listings(
 ) -> Iterable[ListingRow]:
     start = 0
     total_count: Optional[int] = None
+    effective_page_delay = steam_page_delay
+    pages_fetched = 0
 
-    while total_count is None or start < total_count:
-        payload = steam_render_page(
-            session=session,
-            market_hash_name=market_hash_name,
-            start=start,
-            currency=currency,
-            country=country,
-            language=language,
-            max_retries=steam_max_retries,
-        )
-        total_count = int(payload.get("total_count", 0))
+    try:
+        while total_count is None or start < total_count:
+            if should_refresh_steam_session(pages_fetched):
+                print(
+                    f"Refreshing the Steam session after {pages_fetched} listing pages "
+                    f"to reduce late-run rate limiting..."
+                )
+                close_requests_session(session)
+                session = create_requests_session()
 
-        listing_info = payload.get("listinginfo", {})
-        if not listing_info:
-            break
+            try:
+                payload = steam_render_page(
+                    session=session,
+                    market_hash_name=market_hash_name,
+                    start=start,
+                    currency=currency,
+                    country=country,
+                    language=language,
+                    max_retries=steam_max_retries,
+                )
+            except requests.HTTPError as exc:
+                response = getattr(exc, "response", None)
+                if getattr(response, "status_code", None) not in RETRIABLE_STATUS_CODES:
+                    raise
+                close_requests_session(session)
+                payload, session, effective_page_delay = recover_steam_render_page(
+                    session=session,
+                    market_hash_name=market_hash_name,
+                    start=start,
+                    currency=currency,
+                    country=country,
+                    language=language,
+                    max_retries=steam_max_retries,
+                    steam_page_delay=effective_page_delay,
+                )
 
-        assets = payload.get("assets", {}).get(
-            str(STEAM_APP_ID), {}).get(str(STEAM_CONTEXT_ID), {})
+            total_count = int(payload.get("total_count", 0))
 
-        page_number = (start // PAGE_SIZE) + 1
-        for listing_id, listing in listing_info.items():
-            asset = listing.get("asset") or {}
-            asset_id = str(asset.get("id", ""))
-            asset_payload = assets.get(asset_id, {})
+            listing_info = payload.get("listinginfo", {})
+            if not listing_info:
+                break
 
-            inspect_link = extract_inspect_link(
-                asset_payload, listing_id=listing_id, asset_id=asset_id)
+            assets = payload.get("assets", {}).get(
+                str(STEAM_APP_ID), {}).get(str(STEAM_CONTEXT_ID), {})
 
-            price_cents = (listing.get("converted_price") or listing.get("price") or 0) + (
-                listing.get("converted_fee") or listing.get("fee") or 0
-            )
-            price = float(price_cents) / 100.0
+            page_number = (start // PAGE_SIZE) + 1
+            for listing_id, listing in listing_info.items():
+                asset = listing.get("asset") or {}
+                asset_id = str(asset.get("id", ""))
+                asset_payload = assets.get(asset_id, {})
 
-            steam_metadata = extract_steam_metadata(asset_payload)
-            float_value = steam_metadata["float_value"]
-            paint_seed = steam_metadata["paint_seed"]
-            has_stickers = steam_metadata["has_stickers"]
-            sticker_count = steam_metadata["sticker_count"]
+                inspect_link = extract_inspect_link(
+                    asset_payload, listing_id=listing_id, asset_id=asset_id)
 
-            yield ListingRow(
-                listing_id=listing_id,
-                asset_id=asset_id,
-                page=page_number,
-                price=price,
-                currency=str(listing.get("currencyid", currency)),
-                float_value=float_value,
-                wear=get_wear_from_float(float_value),
-                paint_seed=paint_seed,
-                has_stickers=has_stickers,
-                sticker_count=sticker_count,
-                inspect_link=inspect_link,
-            )
+                price_cents = (listing.get("converted_price") or listing.get("price") or 0) + (
+                    listing.get("converted_fee") or listing.get("fee") or 0
+                )
+                price = float(price_cents) / 100.0
 
-        start += PAGE_SIZE
-        # Be nice to Steam and avoid hammering listing pages.
-        time.sleep(steam_page_delay)
+                steam_metadata = extract_steam_metadata(asset_payload)
+                float_value = steam_metadata["float_value"]
+                paint_seed = steam_metadata["paint_seed"]
+                has_stickers = steam_metadata["has_stickers"]
+                sticker_count = steam_metadata["sticker_count"]
+
+                yield ListingRow(
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                    page=page_number,
+                    price=price,
+                    currency=str(listing.get("currencyid", currency)),
+                    float_value=float_value,
+                    wear=get_wear_from_float(float_value),
+                    paint_seed=paint_seed,
+                    has_stickers=has_stickers,
+                    sticker_count=sticker_count,
+                    inspect_link=inspect_link,
+                )
+
+            pages_fetched += 1
+            start += PAGE_SIZE
+            # Be nice to Steam and avoid hammering listing pages.
+            time.sleep(effective_page_delay)
+    finally:
+        close_requests_session(session)
 
 
 def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
@@ -582,6 +616,12 @@ def build_show_dataframe(
     if limit is not None:
         display_dataframe = display_dataframe.head(limit)
 
+    display_dataframe.insert(
+        0,
+        "#",
+        range(1, len(display_dataframe) + 1),
+    )
+
     return display_dataframe
 
 
@@ -657,6 +697,66 @@ def create_requests_session() -> requests.Session:
         }
     )
     return session
+
+
+def close_requests_session(session: requests.Session) -> None:
+    try:
+        session.close()
+    except Exception:
+        pass
+
+
+def should_refresh_steam_session(pages_fetched: int) -> bool:
+    return (
+        pages_fetched > 0
+        and pages_fetched % STEAM_SESSION_REFRESH_PAGE_INTERVAL == 0
+    )
+
+
+def recover_steam_render_page(
+    *,
+    session: requests.Session,
+    market_hash_name: str,
+    start: int,
+    currency: int,
+    country: str,
+    language: str,
+    max_retries: int,
+    steam_page_delay: float,
+) -> tuple[Dict[str, Any], requests.Session, float]:
+    effective_page_delay = max(steam_page_delay, STEAM_RECOVERY_PAGE_DELAY_FLOOR)
+    current_session = session
+
+    for recovery_index, base_wait_seconds in enumerate(STEAM_RECOVERY_WAIT_STEPS, start=1):
+        wait_seconds = max(base_wait_seconds, effective_page_delay)
+        print(
+            f"Steam kept rejecting the page starting at {start}. "
+            f"Cooling down for {wait_seconds:.1f}s and refreshing the session "
+            f"(recovery {recovery_index}/{len(STEAM_RECOVERY_WAIT_STEPS)})..."
+        )
+        time.sleep(wait_seconds)
+        current_session = create_requests_session()
+        try:
+            payload = steam_render_page(
+                session=current_session,
+                market_hash_name=market_hash_name,
+                start=start,
+                currency=currency,
+                country=country,
+                language=language,
+                max_retries=max_retries,
+            )
+            return payload, current_session, effective_page_delay
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) not in RETRIABLE_STATUS_CODES:
+                raise
+            close_requests_session(current_session)
+
+    raise requests.HTTPError(
+        f"Steam kept rate-limiting page start={start} even after extended recovery",
+        response=response,
+    )
 
 
 def dataframe_matches_inline_query(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
