@@ -292,6 +292,28 @@ class TestDesktopAppModule(unittest.TestCase):
         self.assertTrue(png_path.exists())
         self.assertTrue(ico_path.exists())
 
+    def test_clear_results_workspace_keeps_queue_untouched(self):
+        app = smte_desktop.SMTEDesktopApp.__new__(smte_desktop.SMTEDesktopApp)
+        query_items = [object(), object()]
+        app.query_items = query_items
+        app.results_notebook = Mock()
+        app.results_notebook.tabs.return_value = ["tab1", "tab2"]
+        app.results_placeholder = Mock()
+        app.results_placeholder.winfo_ismapped.return_value = False
+        app.results_summary_var = Mock()
+        app.status_var = Mock()
+        app._append_log = Mock()
+
+        app._clear_results_workspace()
+
+        self.assertIs(app.query_items, query_items)
+        app.results_notebook.forget.assert_any_call("tab1")
+        app.results_notebook.forget.assert_any_call("tab2")
+        app.results_placeholder.grid.assert_called_once()
+        app.results_summary_var.set.assert_called_once_with("Run a search to open result tabs here.")
+        app.status_var.set.assert_called_once_with("Results cleared.")
+        app._append_log.assert_called_once_with("Cleared all open result tabs.")
+
 
 if __name__ == "__main__":
     unittest.main()

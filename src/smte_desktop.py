@@ -446,7 +446,13 @@ class SMTEDesktopApp:
         results_frame.rowconfigure(2, weight=1)
 
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(results_frame, textvariable=self.status_var, style="CardStatus.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(results_frame, textvariable=self.status_var, style="CardStatus.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            results_frame,
+            text="Clear Results",
+            style="Secondary.TButton",
+            command=self._clear_results_workspace,
+        ).grid(row=0, column=1, sticky="e")
         ttk.Label(results_frame, textvariable=self.results_summary_var, style="CardHelper.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         log_frame = ttk.Frame(results_frame, style="InnerCard.TFrame", padding=10)
@@ -801,6 +807,15 @@ class SMTEDesktopApp:
         self._refresh_query_tree()
         self._persist_query_queue()
         self._append_log("Cleared the queued query list.")
+
+    def _clear_results_workspace(self) -> None:
+        for tab_id in self.results_notebook.tabs():
+            self.results_notebook.forget(tab_id)
+        if not self.results_placeholder.winfo_ismapped():
+            self.results_placeholder.grid(row=0, column=0, sticky="nsew")
+        self.results_summary_var.set("Run a search to open result tabs here.")
+        self.status_var.set("Results cleared.")
+        self._append_log("Cleared all open result tabs.")
 
     def _refresh_query_tree(self) -> None:
         self.query_tree.delete(*self.query_tree.get_children())
