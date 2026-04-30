@@ -24,6 +24,7 @@ if str(SRC_DIR) not in sys.path:
 import steam_market_to_excel as sme
 import smte_desktop
 import smte_desktop_support as sds
+import third_party_market_support as tpms
 
 
 def make_workspace_temp_dir(name: str) -> Path:
@@ -35,6 +36,17 @@ def make_workspace_temp_dir(name: str) -> Path:
 
 
 class TestDesktopSupportHelpers(unittest.TestCase):
+    def test_provider_registry_includes_expected_sources(self):
+        provider_keys = [definition.key for definition in tpms.list_provider_definitions()]
+        self.assertEqual(
+            provider_keys,
+            [tpms.PROVIDER_STEAM, tpms.PROVIDER_SKINPORT, tpms.PROVIDER_CSFLOAT],
+        )
+
+    def test_describe_provider_status_calls_out_auth_requirement(self):
+        description = tpms.describe_provider_status(tpms.PROVIDER_CSFLOAT)
+        self.assertIn("authentication", description.casefold())
+
     def test_strip_wear_suffix_removes_known_wear(self):
         self.assertEqual(
             sds.strip_wear_suffix("AK-47 | Safari Mesh (Minimal Wear)"),
@@ -264,6 +276,8 @@ class TestDesktopSupportHelpers(unittest.TestCase):
             pause_between_queries=4.5,
             continue_on_error=False,
             combine_case_exports=True,
+            enable_third_party_support=True,
+            third_party_provider=tpms.PROVIDER_CSFLOAT,
         )
 
         sds.save_desktop_settings(original, settings_path=settings_path)
@@ -274,6 +288,19 @@ class TestDesktopSupportHelpers(unittest.TestCase):
         self.assertEqual(loaded.pause_between_queries, 4.5)
         self.assertFalse(loaded.continue_on_error)
         self.assertTrue(loaded.combine_case_exports)
+        self.assertTrue(loaded.enable_third_party_support)
+        self.assertEqual(loaded.third_party_provider, tpms.PROVIDER_CSFLOAT)
+
+    def test_describe_runtime_provider_mode_reflects_future_provider_state(self):
+        settings = sds.DesktopSettings(
+            enable_third_party_support=True,
+            third_party_provider=tpms.PROVIDER_SKINPORT,
+        )
+
+        self.assertEqual(
+            sds.describe_runtime_provider_mode(settings),
+            "Steam + Skinport (official API) groundwork",
+        )
 
     def test_save_and_load_desktop_query_queue_round_trip(self):
         temp_dir = make_workspace_temp_dir("desktop_query_queue")

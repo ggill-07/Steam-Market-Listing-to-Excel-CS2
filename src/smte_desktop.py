@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 import steam_market_to_excel as sme
+import third_party_market_support as tpms
 
 from smte_desktop_support import (
     AUTOCOMPLETE_MIN_CHARS,
@@ -24,6 +25,7 @@ from smte_desktop_support import (
     WEAR_OPTIONS,
     apply_manual_price_override,
     build_query_label,
+    describe_runtime_provider_mode,
     create_query_from_form,
     execute_desktop_query,
     load_desktop_settings,
@@ -142,6 +144,19 @@ class SMTEDesktopApp:
         self.settings_pause_var = tk.StringVar(value=str(self.settings.pause_between_queries))
         self.settings_continue_var = tk.BooleanVar(value=self.settings.continue_on_error)
         self.settings_combine_case_exports_var = tk.BooleanVar(value=self.settings.combine_case_exports)
+        self.settings_enable_third_party_support_var = tk.BooleanVar(value=self.settings.enable_third_party_support)
+        self.provider_label_to_key = tpms.get_provider_choice_mapping()
+        self.provider_key_to_label = {
+            provider_key: provider_label
+            for provider_label, provider_key in self.provider_label_to_key.items()
+        }
+        self.settings_third_party_provider_var = tk.StringVar(
+            value=self.provider_key_to_label.get(
+                self.settings.third_party_provider,
+                tpms.get_provider_label(tpms.PROVIDER_SKINPORT),
+            )
+        )
+        self.provider_summary_var = tk.StringVar()
         self.editor_summary_var = tk.StringVar(value="Start by typing an item name, then choose wear and any filters you care about.")
         self.queue_summary_var = tk.StringVar(value="No searches queued yet.")
         self.results_summary_var = tk.StringVar(value="Run a search to open result tabs here.")
@@ -164,6 +179,8 @@ class SMTEDesktopApp:
             self.has_stickers_var,
             self.no_stickers_var,
             self.no_wear_item_var,
+            self.settings_enable_third_party_support_var,
+            self.settings_third_party_provider_var,
         ]
         traced_variables.extend(self.wear_vars.values())
         for variable in traced_variables:
@@ -454,6 +471,27 @@ class SMTEDesktopApp:
             text="Save all case snapshots into one workbook",
             variable=self.settings_combine_case_exports_var,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            settings_frame,
+            text="Prepare third-party provider support",
+            variable=self.settings_enable_third_party_support_var,
+            command=self._refresh_provider_summary,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(settings_frame, text="Provider", style="SectionLabel.TLabel").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.third_party_provider_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.settings_third_party_provider_var,
+            values=tpms.get_provider_choice_labels(),
+            state="readonly",
+        )
+        self.third_party_provider_combo.grid(row=5, column=0, columnspan=2, sticky="ew", padx=(0, 8))
+        ttk.Label(
+            settings_frame,
+            textvariable=self.provider_summary_var,
+            style="InnerHelper.TLabel",
+            wraplength=300,
+            justify="left",
+        ).grid(row=4, column=2, columnspan=2, rowspan=2, sticky="w", padx=(8, 0), pady=(6, 0))
 
         queue_tables_frame = ttk.Frame(queue_frame, style="Card.TFrame")
         queue_tables_frame.grid(row=0, column=0, sticky="nsew")
@@ -631,6 +669,7 @@ class SMTEDesktopApp:
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         self._refresh_no_wear_mode()
+        self._refresh_provider_summary()
         self._refresh_editor_summary()
 
     def _configure_styles(self, style: ttk.Style) -> None:
@@ -805,6 +844,16 @@ class SMTEDesktopApp:
             self.has_stickers_var.set(False)
             self.no_stickers_var.set(False)
 
+    def _refresh_provider_summary(self, *_args: object) -> None:
+        provider_key = self.provider_label_to_key.get(
+            self.settings_third_party_provider_var.get(),
+            tpms.PROVIDER_SKINPORT,
+        )
+        if not self.settings_enable_third_party_support_var.get():
+            self.provider_summary_var.set("Steam remains the active source. Third-party support is currently off.")
+            return
+        self.provider_summary_var.set(tpms.describe_provider_status(provider_key))
+
     def _set_all_wears(self, selected: bool) -> None:
         if self.no_wear_item_var.get():
             return
@@ -817,6 +866,7 @@ class SMTEDesktopApp:
 
     def _on_editor_state_changed(self, *_args: object) -> None:
         self._refresh_editor_summary()
+        self._refresh_provider_summary()
 
     def _trigger_autocomplete(self, force_refresh: bool) -> None:
         query_text = self._get_item_name_text().strip()
@@ -1390,6 +1440,11 @@ class SMTEDesktopApp:
             pause_between_queries=pause_between_queries,
             continue_on_error=self.settings_continue_var.get(),
             combine_case_exports=self.settings_combine_case_exports_var.get(),
+            enable_third_party_support=self.settings_enable_third_party_support_var.get(),
+            third_party_provider=self.provider_label_to_key.get(
+                self.settings_third_party_provider_var.get(),
+                tpms.PROVIDER_SKINPORT,
+            ),
         )
         return settings
 
@@ -1565,6 +1620,7 @@ class SMTEDesktopApp:
 
         self.status_var.set(f"Running {len(queries_to_run)} queued quer{'y' if len(queries_to_run) == 1 else 'ies'}...")
         self._append_log(self.status_var.get())
+        self._append_log(f"Provider mode: {describe_runtime_provider_mode(settings)}")
 
         def worker() -> None:
             for query_index, query in enumerate(queries_to_run, start=1):

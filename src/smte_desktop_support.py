@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 import steam_market_to_excel as sme
+import third_party_market_support as tpms
 
 APP_DATA_DIR = Path("app_data")
 AUTOCOMPLETE_CACHE_PATH = APP_DATA_DIR / "market_name_autocomplete_cache.json"
@@ -62,6 +63,8 @@ class DesktopSettings:
     pause_between_queries: float = DEFAULT_DESKTOP_PAUSE_BETWEEN_QUERIES
     continue_on_error: bool = True
     combine_case_exports: bool = False
+    enable_third_party_support: bool = False
+    third_party_provider: str = tpms.PROVIDER_SKINPORT
 
 
 @dataclass
@@ -77,6 +80,13 @@ class QueryValidationResult:
     query: DesktopQuery
     is_valid: bool
     status_text: str
+
+
+def describe_runtime_provider_mode(settings: DesktopSettings) -> str:
+    if not settings.enable_third_party_support:
+        return "Steam only"
+    provider_definition = tpms.get_provider_definition(settings.third_party_provider)
+    return f"Steam + {provider_definition.display_name} groundwork"
 
 
 def ensure_app_data_dir() -> Path:

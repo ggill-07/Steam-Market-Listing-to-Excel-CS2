@@ -326,6 +326,8 @@ Desktop app notes:
 
 - you can paste multiple exact skin market names with wear included, one per line, and add them to the queue in one shot
 
+- the desktop settings now include a saved third-party provider section so future adapters like Skinport or authenticated CSFloat support have a stable place to plug in without changing your normal Steam workflow
+
 - `app_data/` is ignored by Git so the cache and settings stay local to each machine
 
 - the desktop app runs searches sequentially by default, which is slower than aggressive batching but safer against Steam rate limits
