@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import re
 import sys
 import time
@@ -25,6 +26,21 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
+from openpyxl.utils import get_column_letter
+
+
+def get_runtime_project_dir() -> Path:
+    """Resolve the project directory for both source runs and bundled desktop builds."""
+
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        # When the bundled desktop app lives in "<project>\\dist", keep exports in
+        # the project root instead of nesting them under dist/.
+        if executable_dir.name.lower() == "dist" and (executable_dir.parent / "src").exists():
+            return executable_dir.parent
+        return executable_dir
+    return Path(__file__).resolve().parents[1]
+
 
 STEAM_APP_ID = 730
 STEAM_CONTEXT_ID = 2
@@ -32,8 +48,12 @@ PAGE_SIZE = 100
 DEFAULT_STEAM_PAGE_DELAY = 0.5
 DEFAULT_STEAM_RETRIES = 5
 PROPID_PATTERN = re.compile(r"%propid:(\d+)%")
+ITEM_NAMEID_PATTERN = re.compile(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)")
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-DEFAULT_OUTPUT_DIR = Path("exports")
+DEFAULT_OUTPUT_DIR = get_runtime_project_dir() / "exports"
+SKIN_EXPORT_SUBDIR = "skins"
+CASE_EXPORT_SUBDIR = "cases"
+STICKER_EXPORT_SUBDIR = "stickers"
 LATEST_POINTER_FILENAME = ".latest_export.txt"
 SUPPORTED_TABLE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 CLI_COMMANDS = {"fetch", "fetch-many", "sort", "filter", "stats", "show", "use"}
@@ -55,6 +75,13 @@ DEFAULT_SHOW_COLUMNS = [
     "paint_seed",
     "listing_id",
 ]
+WEAR_OPTIONS = (
+    "Factory New",
+    "Minimal Wear",
+    "Field-Tested",
+    "Well-Worn",
+    "Battle-Scarred",
+)
 
 
 @dataclass
@@ -78,6 +105,7 @@ class FetchResult:
     output_path: Path
     dataframe: pd.DataFrame
     change_summary: Optional[Dict[str, int]]
+    summary_override: Optional[str] = None
 
 
 def get_wear_from_float(float_value: Optional[float]) -> Optional[str]:
@@ -105,6 +133,18 @@ def normalize_market_hash_name_input(market_hash_name: str) -> str:
     return normalized_name
 
 
+def extract_wear_name_from_market_hash_name(market_hash_name: str) -> Optional[str]:
+    normalized_name = normalize_market_hash_name_input(market_hash_name)
+    for wear_name in WEAR_OPTIONS:
+        if normalized_name.endswith(f" ({wear_name})"):
+            return wear_name
+    return None
+
+
+def market_item_supports_wear(market_hash_name: str) -> bool:
+    return extract_wear_name_from_market_hash_name(market_hash_name) is not None
+
+
 def coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -121,6 +161,64 @@ def coerce_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def parse_price_text(price_text: Any) -> Optional[float]:
+    if not isinstance(price_text, str):
+        return None
+    match = re.search(r"(\d[\d,]*)(?:\.(\d{1,2}))?", price_text)
+    if not match:
+        return None
+    whole_part = match.group(1).replace(",", "")
+    decimal_part = match.group(2) or "0"
+    normalized_text = f"{whole_part}.{decimal_part}"
+    try:
+        return float(normalized_text)
+    except ValueError:
+        return None
+
+
+def extract_market_level_lowest_price(payload: Dict[str, Any]) -> Optional[float]:
+    for key in ("lowest_price", "lowest_price_text", "sell_price_text"):
+        parsed_price = parse_price_text(payload.get(key))
+        if parsed_price is not None and parsed_price > 0:
+            return parsed_price
+    sell_price = coerce_float(payload.get("sell_price"))
+    if sell_price is not None and sell_price > 0:
+        return sell_price / 100.0
+    return None
+
+
+def extract_lowest_histogram_price(payload: Dict[str, Any]) -> Optional[float]:
+    lowest_sell_order = coerce_float(payload.get("lowest_sell_order"))
+    if lowest_sell_order is not None and lowest_sell_order > 0:
+        return lowest_sell_order / 100.0
+
+    sell_order_graph = payload.get("sell_order_graph") or []
+    if sell_order_graph:
+        first_row = sell_order_graph[0]
+        if isinstance(first_row, list) and first_row:
+            return coerce_float(first_row[0])
+
+    return None
+
+
+def extract_listing_total_price(
+    listing: Dict[str, Any],
+    market_level_fallback_price: Optional[float] = None,
+) -> Optional[float]:
+    price_cents = (listing.get("converted_price") or listing.get("price") or 0) + (
+        listing.get("converted_fee") or listing.get("fee") or 0
+    )
+    if price_cents:
+        price = float(price_cents) / 100.0
+        if price > 0:
+            return price
+
+    if market_level_fallback_price is not None and market_level_fallback_price > 0:
+        return market_level_fallback_price
+
+    return None
 
 
 def get_asset_property_lookup(asset_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
@@ -313,7 +411,6 @@ def iter_listings(
                 )
 
             total_count = int(payload.get("total_count", 0))
-
             listing_info = payload.get("listinginfo", {})
             if not listing_info:
                 break
@@ -330,10 +427,9 @@ def iter_listings(
                 inspect_link = extract_inspect_link(
                     asset_payload, listing_id=listing_id, asset_id=asset_id)
 
-                price_cents = (listing.get("converted_price") or listing.get("price") or 0) + (
-                    listing.get("converted_fee") or listing.get("fee") or 0
-                )
-                price = float(price_cents) / 100.0
+                price = extract_listing_total_price(listing)
+                if price is None:
+                    continue
 
                 steam_metadata = extract_steam_metadata(asset_payload)
                 float_value = steam_metadata["float_value"]
@@ -384,14 +480,258 @@ def rows_to_dataframe(rows: List[ListingRow]) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def attach_fetch_timestamp_columns(
+    dataframe: pd.DataFrame,
+    timestamp: Optional[datetime] = None,
+) -> pd.DataFrame:
+    attached_dataframe = dataframe.copy()
+    timestamp = timestamp or datetime.now().astimezone()
+    attached_dataframe["snapshot_date"] = timestamp.date().isoformat()
+    attached_dataframe["snapshot_timestamp"] = timestamp.isoformat(timespec="seconds")
+    return attached_dataframe
+
+
+def build_lowest_listing_snapshot_dataframe(
+    session: requests.Session,
+    market_hash_name: str,
+    currency: int,
+    country: str,
+    language: str,
+    steam_max_retries: int = DEFAULT_STEAM_RETRIES,
+) -> pd.DataFrame:
+    commodity_lowest_price, commodity_price_source = fetch_commodity_lowest_price(
+        session=session,
+        market_hash_name=market_hash_name,
+        currency=currency,
+        country=country,
+        language=language,
+    )
+    payload = steam_render_page(
+        session=session,
+        market_hash_name=market_hash_name,
+        start=0,
+        currency=currency,
+        country=country,
+        language=language,
+        max_retries=steam_max_retries,
+    )
+    listing_info = payload.get("listinginfo", {})
+    market_level_lowest_price = extract_market_level_lowest_price(payload)
+
+    if not listing_info:
+        if commodity_lowest_price is None:
+            return attach_fetch_timestamp_columns(rows_to_dataframe([]))
+
+        snapshot_dataframe = rows_to_dataframe(
+            [
+                ListingRow(
+                    listing_id="",
+                    asset_id="",
+                    page=1,
+                    price=commodity_lowest_price,
+                    currency=str(currency),
+                    float_value=None,
+                    wear=None,
+                    paint_seed=None,
+                    has_stickers=None,
+                    sticker_count=None,
+                    inspect_link=None,
+                )
+            ]
+        )
+        snapshot_dataframe["price_source"] = commodity_price_source or "commodity_fallback"
+        return attach_fetch_timestamp_columns(snapshot_dataframe)
+
+    assets = payload.get("assets", {}).get(str(STEAM_APP_ID), {}).get(str(STEAM_CONTEXT_ID), {})
+    priced_listings: List[tuple[str, Dict[str, Any], float]] = []
+    for listing_id, listing in listing_info.items():
+        listing_price = extract_listing_total_price(
+            listing,
+            market_level_fallback_price=market_level_lowest_price,
+        )
+        if listing_price is None:
+            continue
+        priced_listings.append((str(listing_id), listing, listing_price))
+
+    if not priced_listings:
+        if commodity_lowest_price is None:
+            return attach_fetch_timestamp_columns(rows_to_dataframe([]))
+        snapshot_dataframe = rows_to_dataframe(
+            [
+                ListingRow(
+                    listing_id="",
+                    asset_id="",
+                    page=1,
+                    price=commodity_lowest_price,
+                    currency=str(currency),
+                    float_value=None,
+                    wear=None,
+                    paint_seed=None,
+                    has_stickers=None,
+                    sticker_count=None,
+                    inspect_link=None,
+                )
+            ]
+        )
+        snapshot_dataframe["price_source"] = commodity_price_source or "commodity_fallback"
+        return attach_fetch_timestamp_columns(snapshot_dataframe)
+
+    cheapest_listing_id, cheapest_listing, cheapest_price = min(
+        priced_listings,
+        key=lambda item: (item[2], item[0]),
+    )
+    price_source = "render_listing"
+    if commodity_lowest_price is not None and commodity_lowest_price > 0:
+        cheapest_price = commodity_lowest_price
+        price_source = commodity_price_source or "commodity_fallback"
+    elif market_level_lowest_price is not None and market_level_lowest_price > 0:
+        cheapest_price = min(cheapest_price, market_level_lowest_price)
+        price_source = "render_market_level"
+    asset = cheapest_listing.get("asset") or {}
+    asset_id = str(asset.get("id", ""))
+    asset_payload = assets.get(asset_id, {})
+
+    row = ListingRow(
+        listing_id=str(cheapest_listing_id),
+        asset_id=asset_id,
+        page=1,
+        price=cheapest_price,
+        currency=str(cheapest_listing.get("currencyid", currency)),
+        float_value=None,
+        wear=None,
+        paint_seed=None,
+        has_stickers=None,
+        sticker_count=None,
+        inspect_link=extract_inspect_link(asset_payload, listing_id=str(cheapest_listing_id), asset_id=asset_id),
+    )
+    snapshot_dataframe = rows_to_dataframe([row])
+    snapshot_dataframe["price_source"] = price_source
+    return attach_fetch_timestamp_columns(snapshot_dataframe)
+
+
 def slugify_market_hash_name(market_hash_name: str) -> str:
     market_hash_name = normalize_market_hash_name_input(market_hash_name)
     slug = re.sub(r"[^a-z0-9]+", "_", market_hash_name.lower()).strip("_")
     return slug or "steam_listings"
 
 
+def classify_market_item_export_subdir(market_hash_name: str) -> Optional[str]:
+    normalized_name = normalize_market_hash_name_input(market_hash_name)
+    if market_item_supports_wear(normalized_name):
+        return SKIN_EXPORT_SUBDIR
+
+    if normalized_name.startswith("Sticker |"):
+        return STICKER_EXPORT_SUBDIR
+
+    if re.search(r"\bcase\b", normalized_name, re.IGNORECASE):
+        return CASE_EXPORT_SUBDIR
+
+    return None
+
+
+def fetch_priceoverview_payload(
+    session: requests.Session,
+    market_hash_name: str,
+    currency: int,
+    country: str,
+) -> Dict[str, Any]:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
+    response = session.get(
+        "https://steamcommunity.com/market/priceoverview/",
+        params={
+            "appid": STEAM_APP_ID,
+            "market_hash_name": market_hash_name,
+            "currency": currency,
+            "country": country,
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_listing_page_html(session: requests.Session, market_hash_name: str) -> str:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
+    encoded_name = quote(market_hash_name, safe="")
+    response = session.get(
+        f"https://steamcommunity.com/market/listings/{STEAM_APP_ID}/{encoded_name}",
+        timeout=25,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def extract_item_nameid_from_listing_html(listing_html: str) -> Optional[str]:
+    match = ITEM_NAMEID_PATTERN.search(listing_html)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def fetch_itemordershistogram_payload(
+    session: requests.Session,
+    item_nameid: str,
+    currency: int,
+    country: str,
+    language: str,
+) -> Dict[str, Any]:
+    response = session.get(
+        "https://steamcommunity.com/market/itemordershistogram",
+        params={
+            "country": country,
+            "language": language,
+            "currency": currency,
+            "item_nameid": item_nameid,
+            "two_factor": 0,
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_commodity_lowest_price(
+    session: requests.Session,
+    market_hash_name: str,
+    currency: int,
+    country: str,
+    language: str,
+) -> tuple[Optional[float], Optional[str]]:
+    listing_html = fetch_listing_page_html(session, market_hash_name)
+    item_nameid = extract_item_nameid_from_listing_html(listing_html)
+    if item_nameid:
+        histogram_payload = fetch_itemordershistogram_payload(
+            session=session,
+            item_nameid=item_nameid,
+            currency=currency,
+            country=country,
+            language=language,
+        )
+        if histogram_payload.get("success"):
+            histogram_price = extract_lowest_histogram_price(histogram_payload)
+            if histogram_price is not None and histogram_price > 0:
+                return histogram_price, "itemordershistogram"
+
+    priceoverview_payload = fetch_priceoverview_payload(
+        session=session,
+        market_hash_name=market_hash_name,
+        currency=currency,
+        country=country,
+    )
+    if priceoverview_payload.get("success"):
+        lowest_price = parse_price_text(priceoverview_payload.get("lowest_price"))
+        if lowest_price is not None and lowest_price > 0:
+            return lowest_price, "priceoverview"
+
+    return None, None
+
+
 def default_fetch_output_name(market_hash_name: str) -> str:
-    return f"{slugify_market_hash_name(market_hash_name)}.xlsx"
+    filename = f"{slugify_market_hash_name(market_hash_name)}.xlsx"
+    subdir_name = classify_market_item_export_subdir(market_hash_name)
+    if not subdir_name:
+        return filename
+    return str(Path(subdir_name) / filename)
 
 
 def resolve_output_path(output_name: str) -> Path:
@@ -417,7 +757,7 @@ def get_latest_pointer_path() -> Path:
 def find_newest_export_path() -> Path:
     candidate_paths = [
         path
-        for path in DEFAULT_OUTPUT_DIR.iterdir()
+        for path in DEFAULT_OUTPUT_DIR.rglob("*")
         if path.is_file() and path.suffix.lower() in SUPPORTED_TABLE_SUFFIXES
     ]
     if not candidate_paths:
@@ -479,9 +819,33 @@ def save_table(dataframe: pd.DataFrame, output_name: str) -> Path:
         return output_path
     if suffix in {".xlsx", ".xls"}:
         dataframe.to_excel(output_path, index=False)
+        try:
+            format_excel_output(output_path, dataframe)
+        except Exception:
+            pass
         return output_path
 
     raise ValueError("Output file must end in .csv, .xlsx, or .xls")
+
+
+def format_excel_output(output_path: Path, dataframe: pd.DataFrame) -> None:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(output_path)
+    worksheet = workbook.active
+
+    if worksheet.max_row >= 1 and worksheet.max_column >= 1:
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+    for column_index, column_name in enumerate(dataframe.columns, start=1):
+        series = dataframe[column_name].fillna("").astype(str)
+        max_data_width = max((len(value) for value in series), default=0)
+        header_width = len(str(column_name))
+        column_width = min(max(header_width, max_data_width) + 2, 40)
+        worksheet.column_dimensions[get_column_letter(column_index)].width = column_width
+
+    workbook.save(output_path)
 
 
 def ensure_columns_exist(dataframe: pd.DataFrame, column_names: List[str]) -> None:
@@ -590,7 +954,7 @@ def build_show_dataframe(
 
     if "has_stickers" in display_dataframe.columns and "stickers" not in display_dataframe.columns:
         display_dataframe["stickers"] = display_dataframe["has_stickers"].map(
-            lambda value: "yes" if value else "no"
+            lambda value: "" if pd.isna(value) else ("yes" if bool(value) else "no")
         )
 
     if columns is None:
@@ -598,7 +962,11 @@ def build_show_dataframe(
 
     available_columns = [column for column in columns if column in display_dataframe.columns]
     if not available_columns:
-        raise ValueError("None of the requested display columns exist in the file")
+        if display_dataframe.empty:
+            display_dataframe = pd.DataFrame(columns=columns)
+            available_columns = list(columns)
+        else:
+            raise ValueError("None of the requested display columns exist in the file")
 
     display_dataframe = display_dataframe[available_columns]
 
@@ -685,8 +1053,137 @@ def describe_listing_changes(
     }
 
 
+def sanitize_no_wear_snapshot_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    sanitized_dataframe = dataframe.copy()
+    for column_name in ("float", "wear", "paint_seed", "has_stickers", "sticker_count", "inspect_link"):
+        if column_name in sanitized_dataframe.columns:
+            sanitized_dataframe[column_name] = pd.NA
+    return sanitized_dataframe
+
+
+def append_price_snapshot_history(
+    previous_dataframe: Optional[pd.DataFrame],
+    current_dataframe: pd.DataFrame,
+    market_hash_name: str,
+) -> pd.DataFrame:
+    timestamp = datetime.now().astimezone()
+    snapshot_dataframe = sanitize_no_wear_snapshot_dataframe(current_dataframe)
+    snapshot_dataframe["market_hash_name"] = market_hash_name
+    snapshot_dataframe["snapshot_date"] = timestamp.date().isoformat()
+    snapshot_dataframe["snapshot_timestamp"] = timestamp.isoformat(timespec="seconds")
+
+    if previous_dataframe is None or previous_dataframe.empty:
+        return organize_no_wear_history_dataframe(snapshot_dataframe)
+
+    combined_dataframe = pd.concat(
+        [sanitize_no_wear_snapshot_dataframe(previous_dataframe), snapshot_dataframe],
+        ignore_index=True,
+        sort=False,
+    )
+    return organize_no_wear_history_dataframe(combined_dataframe)
+
+
+def organize_no_wear_history_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    organized_dataframe = dataframe.copy()
+
+    sortable_columns = [
+        column_name
+        for column_name in ("market_hash_name", "snapshot_timestamp")
+        if column_name in organized_dataframe.columns
+    ]
+    if sortable_columns:
+        organized_dataframe = organized_dataframe.sort_values(
+            by=sortable_columns,
+            kind="stable",
+        ).reset_index(drop=True)
+
+    preferred_columns = [
+        "market_hash_name",
+        "snapshot_date",
+        "snapshot_timestamp",
+        "price",
+        "price_source",
+        "currency",
+        "listing_id",
+        "asset_id",
+        "page",
+        "manual_price_override",
+        "manual_price_override_at",
+        "float",
+        "wear",
+        "paint_seed",
+        "has_stickers",
+        "sticker_count",
+        "inspect_link",
+    ]
+    ordered_columns = [
+        column_name for column_name in preferred_columns if column_name in organized_dataframe.columns
+    ]
+    ordered_columns.extend(
+        column_name
+        for column_name in organized_dataframe.columns
+        if column_name not in ordered_columns
+    )
+    return organized_dataframe.loc[:, ordered_columns]
+
+
+def update_latest_no_wear_snapshot_price(
+    output_path: Path,
+    market_hash_name: str,
+    new_price: float,
+) -> pd.DataFrame:
+    market_hash_name = normalize_market_hash_name_input(market_hash_name)
+    if market_item_supports_wear(market_hash_name):
+        raise ValueError("Manual latest-price updates are only supported for no-wear items")
+    if new_price <= 0:
+        raise ValueError("New price must be greater than zero")
+    if not output_path.exists():
+        raise FileNotFoundError(f"No saved export exists at {output_path}")
+
+    dataframe = sanitize_no_wear_snapshot_dataframe(load_table(str(output_path)))
+    if dataframe.empty:
+        raise ValueError("Cannot update the latest price because the saved file has no rows")
+
+    matching_row_indices = pd.Index(dataframe.index)
+    if "market_hash_name" in dataframe.columns:
+        normalized_market_names = dataframe["market_hash_name"].map(
+            lambda value: normalize_market_hash_name_input(str(value).strip())
+            if pd.notna(value)
+            else ""
+        )
+        matching_row_indices = dataframe.index[normalized_market_names == market_hash_name]
+        if matching_row_indices.empty:
+            raise ValueError(
+                f"Cannot update the latest price because {market_hash_name} has no saved rows in {output_path}"
+            )
+    latest_row_index = matching_row_indices[-1]
+
+    if "price" not in dataframe.columns:
+        dataframe["price"] = pd.NA
+    dataframe.loc[latest_row_index, "price"] = float(new_price)
+
+    if "price_source" not in dataframe.columns:
+        dataframe["price_source"] = pd.NA
+    dataframe.loc[latest_row_index, "price_source"] = "manual_override"
+
+    if "manual_price_override" not in dataframe.columns:
+        dataframe["manual_price_override"] = pd.NA
+    dataframe.loc[latest_row_index, "manual_price_override"] = True
+
+    if "manual_price_override_at" not in dataframe.columns:
+        dataframe["manual_price_override_at"] = pd.NA
+    dataframe.loc[latest_row_index, "manual_price_override_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    organized_dataframe = organize_no_wear_history_dataframe(dataframe)
+    save_table(organized_dataframe, str(output_path))
+    return organized_dataframe
+
+
 def create_requests_session() -> requests.Session:
     session = requests.Session()
+    # Steam access is more reliable when we bypass any broken local proxy env vars.
+    # This tool is intended to talk directly to Steam, not through a custom proxy.
+    session.trust_env = False
     session.headers.update(
         {
             "User-Agent": (
@@ -760,6 +1257,12 @@ def recover_steam_render_page(
 
 
 def dataframe_matches_inline_query(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if dataframe.empty:
+        empty_dataframe = dataframe.copy()
+        if empty_dataframe.columns.empty and getattr(args, "sort_by", None):
+            empty_dataframe = pd.DataFrame(columns=list(args.sort_by))
+        return empty_dataframe
+
     filtered_dataframe = filter_dataframe(dataframe, args)
     if getattr(args, "sort_by", None):
         filtered_dataframe = sort_dataframe(filtered_dataframe, args.sort_by, args.descending)
@@ -829,6 +1332,8 @@ def print_fetch_inline_summary(
 
 
 def build_fetch_result_summary(result: FetchResult) -> str:
+    if result.summary_override:
+        return result.summary_override
     if result.change_summary is None:
         return f"Exported {len(result.dataframe)} listings to {result.output_path}"
 
@@ -842,18 +1347,31 @@ def build_fetch_result_summary(result: FetchResult) -> str:
 def fetch_market_dataframe(args: argparse.Namespace, market_hash_name: str) -> pd.DataFrame:
     market_hash_name = normalize_market_hash_name_input(market_hash_name)
     session = create_requests_session()
-    rows = list(
-        iter_listings(
-            session=session,
-            market_hash_name=market_hash_name,
-            currency=args.currency,
-            country=args.country,
-            language=args.language,
-            steam_page_delay=args.steam_page_delay,
-            steam_max_retries=args.steam_max_retries,
+    try:
+        if not market_item_supports_wear(market_hash_name):
+            return build_lowest_listing_snapshot_dataframe(
+                session=session,
+                market_hash_name=market_hash_name,
+                currency=args.currency,
+                country=args.country,
+                language=args.language,
+                steam_max_retries=args.steam_max_retries,
+            )
+
+        rows = list(
+            iter_listings(
+                session=session,
+                market_hash_name=market_hash_name,
+                currency=args.currency,
+                country=args.country,
+                language=args.language,
+                steam_page_delay=args.steam_page_delay,
+                steam_max_retries=args.steam_max_retries,
+            )
         )
-    )
-    return rows_to_dataframe(rows)
+        return attach_fetch_timestamp_columns(rows_to_dataframe(rows))
+    finally:
+        close_requests_session(session)
 
 
 def sync_market_dataframe(
@@ -864,18 +1382,53 @@ def sync_market_dataframe(
 ) -> FetchResult:
     market_hash_name = normalize_market_hash_name_input(market_hash_name)
     resolved_output_name = output_name or default_fetch_output_name(market_hash_name)
-    output_path = resolve_output_path(resolved_output_name)
+    if output_name is None:
+        output_path = resolve_output_path(str(DEFAULT_OUTPUT_DIR / Path(resolved_output_name)))
+    else:
+        output_path = resolve_output_path(resolved_output_name)
     previous_dataframe = load_table(str(output_path)) if output_path.exists() else None
+    summary_override: Optional[str] = None
 
-    save_table(dataframe, str(output_path))
+    if not market_item_supports_wear(market_hash_name):
+        if dataframe.empty:
+            if previous_dataframe is not None:
+                final_dataframe = sanitize_no_wear_snapshot_dataframe(previous_dataframe)
+                summary_override = (
+                    f"Steam did not return a current active listing price for {market_hash_name}. "
+                    f"Kept {len(final_dataframe)} historical snapshot row(s) in {output_path}"
+                )
+            else:
+                final_dataframe = dataframe.copy()
+                summary_override = (
+                    f"Steam did not return a current active listing price for {market_hash_name}, "
+                    f"so no snapshot row was added."
+                )
+        else:
+            final_dataframe = append_price_snapshot_history(
+                previous_dataframe=previous_dataframe,
+                current_dataframe=dataframe,
+                market_hash_name=market_hash_name,
+            )
+            appended_rows = len(dataframe)
+            summary_override = (
+                f"Appended {appended_rows} lowest-price snapshot row(s) for {market_hash_name} "
+                f"into {output_path} (history rows: {len(final_dataframe)})"
+            )
+    else:
+        final_dataframe = dataframe
+
+    save_table(final_dataframe, str(output_path))
     if update_latest:
         write_latest_pointer(output_path)
 
     return FetchResult(
         market_hash_name=market_hash_name,
         output_path=output_path,
-        dataframe=dataframe,
-        change_summary=describe_listing_changes(previous_dataframe, dataframe),
+        dataframe=final_dataframe,
+        change_summary=describe_listing_changes(previous_dataframe, final_dataframe)
+        if market_item_supports_wear(market_hash_name)
+        else None,
+        summary_override=summary_override,
     )
 
 

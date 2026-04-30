@@ -39,7 +39,7 @@ class MarketSuggestion:
 @dataclass
 class DesktopQuery:
     base_name: str
-    wear: str
+    wear: Optional[str] = None
     max_float: Optional[float] = None
     max_price: Optional[float] = None
     paint_seed: Optional[int] = None
@@ -61,6 +61,7 @@ class DesktopSettings:
     steam_max_retries: int = sme.DEFAULT_STEAM_RETRIES
     pause_between_queries: float = DEFAULT_DESKTOP_PAUSE_BETWEEN_QUERIES
     continue_on_error: bool = True
+    combine_case_exports: bool = False
 
 
 @dataclass
@@ -69,6 +70,13 @@ class QueryExecutionResult:
     fetch_result: sme.FetchResult
     matched_dataframe: pd.DataFrame
     display_dataframe: pd.DataFrame
+
+
+@dataclass
+class QueryValidationResult:
+    query: DesktopQuery
+    is_valid: bool
+    status_text: str
 
 
 def ensure_app_data_dir() -> Path:
@@ -86,6 +94,7 @@ def strip_wear_suffix(market_hash_name: str) -> str:
 
 
 def extract_wear_name(market_hash_name: str) -> Optional[str]:
+    market_hash_name = sme.normalize_market_hash_name_input(market_hash_name)
     for wear_name in WEAR_OPTIONS:
         suffix = f" ({wear_name})"
         if market_hash_name.endswith(suffix):
@@ -93,8 +102,10 @@ def extract_wear_name(market_hash_name: str) -> Optional[str]:
     return None
 
 
-def build_market_hash_name(base_name: str, wear_name: str) -> str:
+def build_market_hash_name(base_name: str, wear_name: Optional[str]) -> str:
     normalized_base_name = strip_wear_suffix(base_name.strip())
+    if not wear_name:
+        return normalized_base_name
     return f"{normalized_base_name} ({wear_name})"
 
 
@@ -102,10 +113,49 @@ def build_query_label(query: DesktopQuery) -> str:
     return build_market_hash_name(query.base_name, query.wear)
 
 
+def _normalize_item_name_for_match(item_name: str) -> str:
+    normalized_item_name = sme.normalize_market_hash_name_input(item_name.strip())
+    return sme.normalize_market_hash_name_input(strip_wear_suffix(normalized_item_name)).casefold()
+
+
+def query_matches_suggestion(query: DesktopQuery, suggestion: MarketSuggestion) -> bool:
+    normalized_query_base = _normalize_item_name_for_match(query.base_name)
+    normalized_suggestion_base = sme.normalize_market_hash_name_input(suggestion.base_name).casefold()
+    normalized_suggestion_example = _normalize_item_name_for_match(suggestion.example_hash_name)
+
+    if normalized_query_base not in {normalized_suggestion_base, normalized_suggestion_example}:
+        return False
+
+    if query.wear is None:
+        return not suggestion.wears
+
+    return query.wear in suggestion.wears
+
+
+def validate_query_against_market(
+    query: DesktopQuery,
+    autocomplete_cache: MarketAutocompleteCache,
+) -> QueryValidationResult:
+    suggestions = autocomplete_cache.fetch_and_cache_suggestions(query.base_name)
+    is_valid = any(query_matches_suggestion(query, suggestion) for suggestion in suggestions)
+    if is_valid:
+        return QueryValidationResult(
+            query=query,
+            is_valid=True,
+            status_text="Valid",
+        )
+    return QueryValidationResult(
+        query=query,
+        is_valid=False,
+        status_text="Not found",
+    )
+
+
 def create_query_from_form(
     *,
     base_name: str,
-    wear_name: str,
+    wear_name: Optional[str],
+    item_has_no_wear: bool,
     max_float_text: str,
     max_price_text: str,
     paint_seed_text: str,
@@ -120,7 +170,13 @@ def create_query_from_form(
     normalized_base_name = strip_wear_suffix(base_name.strip())
     if not normalized_base_name:
         raise ValueError("Item name is required")
-    if wear_name not in WEAR_OPTIONS:
+    if item_has_no_wear:
+        wear_name = None
+        has_stickers = False
+        no_stickers = False
+        min_sticker_count_text = ""
+        max_sticker_count_text = ""
+    elif wear_name not in WEAR_OPTIONS:
         raise ValueError("At least one valid wear must be selected")
     if has_stickers and no_stickers:
         raise ValueError("Choose either has stickers or no stickers, not both")
@@ -158,10 +214,14 @@ def create_query_from_form(
     if not normalized_sort_by:
         normalized_sort_by = ["price"]
 
+    max_float = parse_optional_float(max_float_text, "Max float")
+    if item_has_no_wear and max_float is not None:
+        raise ValueError("Max float only applies to wear-based items")
+
     return DesktopQuery(
         base_name=normalized_base_name,
         wear=wear_name,
-        max_float=parse_optional_float(max_float_text, "Max float"),
+        max_float=max_float,
         max_price=parse_optional_float(max_price_text, "Max price"),
         paint_seed=parse_optional_int(paint_seed_text, "Paint seed"),
         has_stickers=has_stickers,
@@ -175,6 +235,7 @@ def create_query_from_form(
 
 
 def build_fetch_namespace(query: DesktopQuery, settings: DesktopSettings) -> argparse.Namespace:
+    supports_wear = query.wear is not None
     return argparse.Namespace(
         market_hash_name=build_query_label(query),
         output=None,
@@ -184,15 +245,15 @@ def build_fetch_namespace(query: DesktopQuery, settings: DesktopSettings) -> arg
         steam_page_delay=settings.steam_page_delay,
         steam_max_retries=settings.steam_max_retries,
         min_float=None,
-        max_float=query.max_float,
+        max_float=query.max_float if supports_wear else None,
         min_price=None,
         max_price=query.max_price,
         wear=query.wear,
         paint_seed=query.paint_seed,
-        has_stickers=query.has_stickers,
-        no_stickers=query.no_stickers,
-        min_sticker_count=query.min_sticker_count,
-        max_sticker_count=query.max_sticker_count,
+        has_stickers=query.has_stickers if supports_wear else False,
+        no_stickers=query.no_stickers if supports_wear else False,
+        min_sticker_count=query.min_sticker_count if supports_wear else None,
+        max_sticker_count=query.max_sticker_count if supports_wear else None,
         sort_by=query.sort_by,
         descending=query.descending,
         show=False,
@@ -201,16 +262,43 @@ def build_fetch_namespace(query: DesktopQuery, settings: DesktopSettings) -> arg
     )
 
 
-def execute_desktop_query(query: DesktopQuery, settings: DesktopSettings) -> QueryExecutionResult:
+def resolve_desktop_output_name(query: DesktopQuery, settings: DesktopSettings) -> Optional[str]:
+    market_hash_name = build_query_label(query)
+    if query.wear is None and settings.combine_case_exports:
+        if sme.classify_market_item_export_subdir(market_hash_name) == sme.CASE_EXPORT_SUBDIR:
+            return str(Path(sme.CASE_EXPORT_SUBDIR) / "all_cases.xlsx")
+    return None
+
+
+def filter_result_dataframe_to_query(
+    dataframe: pd.DataFrame,
+    query: DesktopQuery,
+) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe.copy()
+
+    market_hash_name = build_query_label(query)
+    if "market_hash_name" in dataframe.columns:
+        normalized_market_names = dataframe["market_hash_name"].map(
+            lambda value: sme.normalize_market_hash_name_input(str(value).strip())
+            if pd.notna(value)
+            else ""
+        )
+        matching_dataframe = dataframe[normalized_market_names == market_hash_name]
+        if not matching_dataframe.empty:
+            return matching_dataframe.copy()
+
+    return dataframe.copy()
+
+
+def _build_query_execution_result(
+    query: DesktopQuery,
+    settings: DesktopSettings,
+    fetch_result: sme.FetchResult,
+) -> QueryExecutionResult:
     fetch_args = build_fetch_namespace(query, settings)
-    dataframe = sme.fetch_market_dataframe(fetch_args, fetch_args.market_hash_name)
-    fetch_result = sme.sync_market_dataframe(
-        dataframe=dataframe,
-        market_hash_name=fetch_args.market_hash_name,
-        output_name=None,
-        update_latest=True,
-    )
-    matched_dataframe = sme.dataframe_matches_inline_query(fetch_result.dataframe, fetch_args)
+    query_scoped_dataframe = filter_result_dataframe_to_query(fetch_result.dataframe, query)
+    matched_dataframe = sme.dataframe_matches_inline_query(query_scoped_dataframe, fetch_args)
     display_dataframe = sme.build_show_dataframe(
         matched_dataframe,
         columns=None,
@@ -221,6 +309,55 @@ def execute_desktop_query(query: DesktopQuery, settings: DesktopSettings) -> Que
         fetch_result=fetch_result,
         matched_dataframe=matched_dataframe,
         display_dataframe=display_dataframe,
+    )
+
+
+def execute_desktop_query(query: DesktopQuery, settings: DesktopSettings) -> QueryExecutionResult:
+    fetch_args = build_fetch_namespace(query, settings)
+    dataframe = sme.fetch_market_dataframe(fetch_args, fetch_args.market_hash_name)
+    fetch_result = sme.sync_market_dataframe(
+        dataframe=dataframe,
+        market_hash_name=fetch_args.market_hash_name,
+        output_name=resolve_desktop_output_name(query, settings),
+        update_latest=True,
+    )
+    return _build_query_execution_result(
+        query=query,
+        settings=settings,
+        fetch_result=fetch_result,
+    )
+
+
+def apply_manual_price_override(
+    query: DesktopQuery,
+    settings: DesktopSettings,
+    new_price: float,
+    *,
+    output_path: Optional[Path] = None,
+) -> QueryExecutionResult:
+    market_hash_name = build_query_label(query)
+    resolved_output_path = output_path or sme.resolve_output_path(
+        str(sme.DEFAULT_OUTPUT_DIR / Path(sme.default_fetch_output_name(market_hash_name)))
+    )
+    updated_dataframe = sme.update_latest_no_wear_snapshot_price(
+        output_path=resolved_output_path,
+        market_hash_name=market_hash_name,
+        new_price=new_price,
+    )
+    fetch_result = sme.FetchResult(
+        market_hash_name=market_hash_name,
+        output_path=resolved_output_path,
+        dataframe=updated_dataframe,
+        change_summary=None,
+        summary_override=(
+            f"Manually updated the latest saved price for {market_hash_name} "
+            f"to ${new_price:.2f} in {resolved_output_path}"
+        ),
+    )
+    return _build_query_execution_result(
+        query=query,
+        settings=settings,
+        fetch_result=fetch_result,
     )
 
 
@@ -258,29 +395,55 @@ class MarketAutocompleteCache:
         ]
 
     def fetch_and_cache_suggestions(self, query_text: str) -> List[MarketSuggestion]:
-        normalized_query = query_text.strip()
-        normalized_query = sme.normalize_market_hash_name_input(normalized_query)
-        if len(normalized_query) < AUTOCOMPLETE_MIN_CHARS:
+        raw_query = query_text.strip()
+        normalized_query = sme.normalize_market_hash_name_input(raw_query)
+        if len(raw_query) < AUTOCOMPLETE_MIN_CHARS:
             return []
 
+        stattrak_requested = bool(sme.STATTRAK_PREFIX_PATTERN.match(raw_query))
+        query_candidates: List[str] = []
+        for candidate in (
+            raw_query,
+            normalized_query,
+            sme.STATTRAK_PREFIX_PATTERN.sub("", raw_query).strip() if stattrak_requested else "",
+        ):
+            if candidate and candidate not in query_candidates:
+                query_candidates.append(candidate)
+
         session = sme.create_requests_session()
-        response = session.get(
-            "https://steamcommunity.com/market/search/render/",
-            params={
-                "query": normalized_query,
-                "start": 0,
-                "count": AUTOCOMPLETE_PAGE_SIZE,
-                "search_descriptions": 0,
-                "sort_column": "popular",
-                "sort_dir": "desc",
-                "appid": sme.STEAM_APP_ID,
-                "norender": 1,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        raw_results = payload.get("results", [])
+        raw_results: List[Dict[str, Any]] = []
+        try:
+            for candidate in query_candidates:
+                response = session.get(
+                    "https://steamcommunity.com/market/search/render/",
+                    params={
+                        "query": candidate,
+                        "start": 0,
+                        "count": AUTOCOMPLETE_PAGE_SIZE,
+                        "search_descriptions": 0,
+                        "sort_column": "popular",
+                        "sort_dir": "desc",
+                        "appid": sme.STEAM_APP_ID,
+                        "norender": 1,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                candidate_results = payload.get("results", [])
+                if stattrak_requested:
+                    candidate_results = [
+                        item
+                        for item in candidate_results
+                        if "StatTrak" in str(
+                            item.get("hash_name")
+                            or (item.get("asset_description") or {}).get("market_hash_name")
+                            or ""
+                        )
+                    ]
+                raw_results.extend(candidate_results)
+        finally:
+            sme.close_requests_session(session)
 
         by_base_name: Dict[str, MarketSuggestion] = {}
         for raw_item in raw_results:
@@ -289,7 +452,7 @@ class MarketAutocompleteCache:
             if not hash_name:
                 continue
 
-            base_name = str(asset_description.get("market_bucket_group_name") or strip_wear_suffix(hash_name)).strip()
+            base_name = strip_wear_suffix(hash_name).strip()
             wear_name = extract_wear_name(hash_name)
             suggestion = by_base_name.get(base_name)
             if suggestion is None:
@@ -309,7 +472,7 @@ class MarketAutocompleteCache:
         )
 
         with self._lock:
-            self._cache[normalized_query.lower()] = [
+            serialized_suggestions = [
                 {
                     "base_name": suggestion.base_name,
                     "example_hash_name": suggestion.example_hash_name,
@@ -317,6 +480,8 @@ class MarketAutocompleteCache:
                 }
                 for suggestion in suggestions
             ]
+            for cache_key in {raw_query.lower(), normalized_query.lower()}:
+                self._cache[cache_key] = serialized_suggestions
             self._save_cache()
 
         return suggestions

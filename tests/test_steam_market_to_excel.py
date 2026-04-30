@@ -129,9 +129,23 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.resolve_output_path("result.xlsx")
         self.assertEqual(result, sme.DEFAULT_OUTPUT_DIR / "result.xlsx")
 
+    def test_get_runtime_project_dir_uses_project_root_for_dist_builds(self):
+        temp_dir = make_workspace_temp_dir("runtime_project_dir")
+        dist_dir = temp_dir / "dist"
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        (temp_dir / "src").mkdir(parents=True, exist_ok=True)
+        fake_executable = dist_dir / "smte-desktop.exe"
+        fake_executable.write_text("placeholder", encoding="utf-8")
+
+        with patch.object(sme.sys, "executable", str(fake_executable)):
+            with patch.object(sme.sys, "frozen", True, create=True):
+                result = sme.get_runtime_project_dir()
+
+        self.assertEqual(result, temp_dir)
+
     def test_default_fetch_output_name_uses_market_name_slug(self):
         result = sme.default_fetch_output_name("AK-47 | Safari Mesh (Minimal Wear)")
-        self.assertEqual(result, "ak_47_safari_mesh_minimal_wear.xlsx")
+        self.assertEqual(Path(result), Path("skins") / "ak_47_safari_mesh_minimal_wear.xlsx")
 
     def test_normalize_market_hash_name_input_supports_stattrak_aliases(self):
         self.assertEqual(
@@ -145,7 +159,45 @@ class TestBasicHelpers(unittest.TestCase):
 
     def test_default_fetch_output_name_normalizes_stattrak_alias(self):
         result = sme.default_fetch_output_name("StatTrack AK-47 | Redline (Field-Tested)")
-        self.assertEqual(result, "stattrak_ak_47_redline_field_tested.xlsx")
+        self.assertEqual(Path(result), Path("skins") / "stattrak_ak_47_redline_field_tested.xlsx")
+
+    def test_default_fetch_output_name_routes_cases_and_stickers_to_subfolders(self):
+        case_result = sme.default_fetch_output_name("Gallery Case")
+        sticker_result = sme.default_fetch_output_name("Sticker | Crown (Foil)")
+
+        self.assertEqual(Path(case_result), Path("cases") / "gallery_case.xlsx")
+        self.assertEqual(Path(sticker_result), Path("stickers") / "sticker_crown_foil.xlsx")
+
+    def test_extract_wear_name_from_market_hash_name_reads_known_wear(self):
+        self.assertEqual(
+            sme.extract_wear_name_from_market_hash_name("AK-47 | Safari Mesh (Minimal Wear)"),
+            "Minimal Wear",
+        )
+        self.assertIsNone(
+            sme.extract_wear_name_from_market_hash_name("Sticker | Crown (Foil)")
+        )
+
+    def test_market_item_supports_wear_matches_skin_vs_case_style_items(self):
+        self.assertTrue(sme.market_item_supports_wear("AK-47 | Safari Mesh (Minimal Wear)"))
+        self.assertFalse(sme.market_item_supports_wear("Gallery Case"))
+
+    def test_parse_price_text_reads_currency_strings(self):
+        self.assertEqual(sme.parse_price_text("$1.23"), 1.23)
+        self.assertEqual(sme.parse_price_text("CDN$ 12.45"), 12.45)
+        self.assertIsNone(sme.parse_price_text("not a price"))
+
+    def test_extract_listing_total_price_ignores_zero_and_uses_market_fallback(self):
+        self.assertEqual(
+            sme.extract_listing_total_price({"price": 110, "fee": 5}),
+            1.15,
+        )
+        self.assertEqual(
+            sme.extract_listing_total_price({"price": 0, "fee": 0}, market_level_fallback_price=2.45),
+            2.45,
+        )
+        self.assertIsNone(
+            sme.extract_listing_total_price({"price": 0, "fee": 0}, market_level_fallback_price=None)
+        )
 
     def test_resolve_output_path_keeps_custom_folder_paths(self):
         result = sme.resolve_output_path("custom_folder/result.xlsx")
@@ -159,8 +211,10 @@ class TestBasicHelpers(unittest.TestCase):
 
     def test_resolve_input_path_supports_latest_keyword(self):
         temp_dir = make_workspace_temp_dir("resolve_latest")
-        older_file = temp_dir / "older.xlsx"
-        newer_file = temp_dir / "newer.xlsx"
+        older_file = temp_dir / "skins" / "older.xlsx"
+        newer_file = temp_dir / "cases" / "newer.xlsx"
+        older_file.parent.mkdir(parents=True, exist_ok=True)
+        newer_file.parent.mkdir(parents=True, exist_ok=True)
         older_file.write_text("older", encoding="utf-8")
         newer_file.write_text("newer", encoding="utf-8")
         older_timestamp = 1_700_000_000
@@ -178,8 +232,10 @@ class TestBasicHelpers(unittest.TestCase):
 
     def test_resolve_input_path_prefers_pinned_latest_file(self):
         temp_dir = make_workspace_temp_dir("resolve_pinned_latest")
-        older_file = temp_dir / "older.xlsx"
-        pinned_file = temp_dir / "pinned.xlsx"
+        older_file = temp_dir / "skins" / "older.xlsx"
+        pinned_file = temp_dir / "cases" / "pinned.xlsx"
+        older_file.parent.mkdir(parents=True, exist_ok=True)
+        pinned_file.parent.mkdir(parents=True, exist_ok=True)
         older_file.write_text("older", encoding="utf-8")
         pinned_file.write_text("pinned", encoding="utf-8")
         sme_pointer_path = temp_dir / sme.LATEST_POINTER_FILENAME
@@ -234,6 +290,102 @@ class TestBasicHelpers(unittest.TestCase):
         result = sme.describe_listing_changes(previous_dataframe, current_dataframe)
 
         self.assertEqual(result, {"added": 1, "removed": 1, "unchanged": 1})
+
+    def test_append_price_snapshot_history_adds_timestamp_columns(self):
+        current_dataframe = pd.DataFrame(
+            [{"listing_id": "listing-1", "price": 2.45, "wear": None}]
+        )
+
+        history_dataframe = sme.append_price_snapshot_history(
+            previous_dataframe=None,
+            current_dataframe=current_dataframe,
+            market_hash_name="Gallery Case",
+        )
+
+        self.assertEqual(len(history_dataframe), 1)
+        self.assertEqual(history_dataframe.iloc[0]["market_hash_name"], "Gallery Case")
+        self.assertIn("snapshot_date", history_dataframe.columns)
+        self.assertIn("snapshot_timestamp", history_dataframe.columns)
+        self.assertTrue(pd.isna(history_dataframe.iloc[0]["wear"]))
+
+    def test_attach_fetch_timestamp_columns_adds_timestamp_metadata(self):
+        dataframe = pd.DataFrame([{"listing_id": "listing-1", "price": 1.25}])
+
+        timestamped_dataframe = sme.attach_fetch_timestamp_columns(dataframe)
+
+        self.assertIn("snapshot_date", timestamped_dataframe.columns)
+        self.assertIn("snapshot_timestamp", timestamped_dataframe.columns)
+
+    def test_extract_lowest_histogram_price_reads_lowest_sell_order(self):
+        self.assertEqual(
+            sme.extract_lowest_histogram_price({"lowest_sell_order": 222}),
+            2.22,
+        )
+        self.assertEqual(
+            sme.extract_lowest_histogram_price({"sell_order_graph": [[2.67, 65, "x"]]}),
+            2.67,
+        )
+
+    def test_extract_item_nameid_from_listing_html_reads_market_load_order_spread(self):
+        listing_html = "<script>Market_LoadOrderSpread( 176288467 );</script>"
+        self.assertEqual(
+            sme.extract_item_nameid_from_listing_html(listing_html),
+            "176288467",
+        )
+
+    def test_create_requests_session_disables_environment_proxies(self):
+        session = sme.create_requests_session()
+        self.assertFalse(session.trust_env)
+        sme.close_requests_session(session)
+
+    def test_update_latest_no_wear_snapshot_price_updates_latest_row_and_tags_override(self):
+        temp_dir = make_workspace_temp_dir("manual_case_price_update")
+        output_path = temp_dir / "cases" / "all_cases.xlsx"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        starting_dataframe = pd.DataFrame(
+            [
+                {"listing_id": "old-row", "price": 1.25, "market_hash_name": "Gallery Case"},
+                {"listing_id": "other-case-latest", "price": 2.75, "market_hash_name": "Kilowatt Case"},
+                {"listing_id": "latest-row", "price": 1.50, "market_hash_name": "Gallery Case"},
+            ]
+        )
+        starting_dataframe.to_excel(output_path, index=False)
+
+        updated_dataframe = sme.update_latest_no_wear_snapshot_price(
+            output_path=output_path,
+            market_hash_name="Gallery Case",
+            new_price=1.68,
+        )
+
+        gallery_rows = updated_dataframe[updated_dataframe["market_hash_name"] == "Gallery Case"]
+        kilowatt_rows = updated_dataframe[updated_dataframe["market_hash_name"] == "Kilowatt Case"]
+        self.assertEqual(gallery_rows.iloc[-1]["price"], 1.68)
+        self.assertEqual(gallery_rows.iloc[-1]["price_source"], "manual_override")
+        self.assertTrue(gallery_rows.iloc[-1]["manual_price_override"])
+        self.assertEqual(kilowatt_rows.iloc[-1]["price"], 2.75)
+        self.assertIn("manual_price_override_at", updated_dataframe.columns)
+
+    def test_append_price_snapshot_history_organizes_columns_for_readability(self):
+        history_dataframe = sme.append_price_snapshot_history(
+            previous_dataframe=pd.DataFrame(
+                [
+                    {
+                        "listing_id": "",
+                        "price": 1.25,
+                        "market_hash_name": "Kilowatt Case",
+                        "snapshot_timestamp": "2026-04-29T09:00:00-07:00",
+                    }
+                ]
+            ),
+            current_dataframe=pd.DataFrame([{"listing_id": "", "price": 1.68, "currency": "1"}]),
+            market_hash_name="Gallery Case",
+        )
+
+        self.assertEqual(
+            list(history_dataframe.columns[:5]),
+            ["market_hash_name", "snapshot_date", "snapshot_timestamp", "price", "currency"],
+        )
+        self.assertEqual(history_dataframe.iloc[0]["market_hash_name"], "Gallery Case")
 
     def test_parse_args_supports_sort_subcommand(self):
         args = sme.parse_args(["sort", "exports/sample.xlsx", "--by", "float", "price"])
@@ -669,6 +821,53 @@ class TestListingAndExportFlow(unittest.TestCase):
         # The function sleeps once after the page finishes.
         self.assertEqual(mocked_sleep.call_count, 1)
 
+    @patch("steam_market_to_excel.time.sleep")
+    def test_iter_listings_skips_zero_priced_listings(self, mocked_sleep):
+        fake_steam_payload = {
+            "success": True,
+            "total_count": 2,
+            "listinginfo": {
+                "listing-zero": {
+                    "asset": {"id": "asset-zero"},
+                    "price": 0,
+                    "fee": 0,
+                    "currencyid": 1,
+                },
+                "listing-good": {
+                    "asset": {"id": "asset-good"},
+                    "price": 125,
+                    "fee": 25,
+                    "currencyid": 1,
+                },
+            },
+            "assets": {
+                str(sme.STEAM_APP_ID): {
+                    str(sme.STEAM_CONTEXT_ID): {
+                        "asset-zero": {},
+                        "asset-good": {},
+                    }
+                }
+            },
+        }
+
+        with patch("steam_market_to_excel.steam_render_page", return_value=fake_steam_payload):
+            rows = list(
+                sme.iter_listings(
+                    session=Mock(),
+                    market_hash_name="Gallery Case",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_page_delay=0,
+                    steam_max_retries=1,
+                )
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].listing_id, "listing-good")
+        self.assertEqual(rows[0].price, 1.5)
+        self.assertEqual(mocked_sleep.call_count, 1)
+
     def test_rows_to_dataframe_creates_expected_columns(self):
         rows = [
             sme.ListingRow(
@@ -706,6 +905,159 @@ class TestListingAndExportFlow(unittest.TestCase):
         )
         self.assertEqual(dataframe.iloc[0]["listing_id"], "listing-1")
         self.assertEqual(dataframe.iloc[0]["float"], 0.12)
+
+    def test_build_lowest_listing_snapshot_dataframe_uses_cheapest_first_page_listing(self):
+        fake_payload = {
+            "success": True,
+            "total_count": 5000,
+            "listinginfo": {
+                "listing-2": {
+                    "price": 120,
+                    "fee": 5,
+                    "currencyid": 1,
+                    "asset": {"id": "asset-2"},
+                },
+                "listing-1": {
+                    "price": 110,
+                    "fee": 5,
+                    "currencyid": 1,
+                    "asset": {"id": "asset-1"},
+                },
+            },
+            "assets": {
+                "730": {
+                    "2": {
+                        "asset-1": {},
+                        "asset-2": {},
+                    }
+                }
+            },
+        }
+
+        with patch("steam_market_to_excel.steam_render_page", return_value=fake_payload):
+            with patch("steam_market_to_excel.fetch_commodity_lowest_price", return_value=(None, None)):
+                dataframe = sme.build_lowest_listing_snapshot_dataframe(
+                    session=Mock(),
+                    market_hash_name="Gallery Case",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_max_retries=1,
+                )
+
+        self.assertEqual(len(dataframe), 1)
+        self.assertEqual(dataframe.iloc[0]["listing_id"], "listing-1")
+        self.assertEqual(dataframe.iloc[0]["page"], 1)
+        self.assertEqual(dataframe.iloc[0]["price"], 1.15)
+        self.assertTrue(pd.isna(dataframe.iloc[0]["float"]))
+        self.assertTrue(pd.isna(dataframe.iloc[0]["wear"]))
+        self.assertEqual(dataframe.iloc[0]["price_source"], "render_listing")
+        self.assertIn("snapshot_timestamp", dataframe.columns)
+
+    def test_build_lowest_listing_snapshot_dataframe_uses_market_fallback_when_listing_price_is_zero(self):
+        fake_payload = {
+            "success": True,
+            "total_count": 50,
+            "lowest_price": "$2.45",
+            "listinginfo": {
+                "listing-1": {
+                    "price": 0,
+                    "fee": 0,
+                    "currencyid": 1,
+                    "asset": {"id": "asset-1"},
+                },
+            },
+            "assets": {
+                "730": {
+                    "2": {
+                        "asset-1": {},
+                    }
+                }
+            },
+        }
+
+        with patch("steam_market_to_excel.steam_render_page", return_value=fake_payload):
+            with patch("steam_market_to_excel.fetch_commodity_lowest_price", return_value=(2.45, "priceoverview")):
+                dataframe = sme.build_lowest_listing_snapshot_dataframe(
+                    session=Mock(),
+                    market_hash_name="Gallery Case",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_max_retries=1,
+                )
+
+        self.assertEqual(len(dataframe), 1)
+        self.assertEqual(dataframe.iloc[0]["price"], 2.45)
+        self.assertEqual(dataframe.iloc[0]["price_source"], "priceoverview")
+
+    def test_build_lowest_listing_snapshot_dataframe_prefers_lower_market_level_price(self):
+        fake_payload = {
+            "success": True,
+            "total_count": 50,
+            "lowest_price": "$2.45",
+            "listinginfo": {
+                "listing-1": {
+                    "price": 250,
+                    "fee": 10,
+                    "currencyid": 1,
+                    "asset": {"id": "asset-1"},
+                },
+                "listing-2": {
+                    "price": 255,
+                    "fee": 10,
+                    "currencyid": 1,
+                    "asset": {"id": "asset-2"},
+                },
+            },
+            "assets": {
+                "730": {
+                    "2": {
+                        "asset-1": {},
+                        "asset-2": {},
+                    }
+                }
+            },
+        }
+
+        with patch("steam_market_to_excel.steam_render_page", return_value=fake_payload):
+            with patch("steam_market_to_excel.fetch_commodity_lowest_price", return_value=(2.22, "itemordershistogram")):
+                dataframe = sme.build_lowest_listing_snapshot_dataframe(
+                    session=Mock(),
+                    market_hash_name="Gallery Case",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_max_retries=1,
+                )
+
+        self.assertEqual(len(dataframe), 1)
+        self.assertEqual(dataframe.iloc[0]["price"], 2.22)
+        self.assertEqual(dataframe.iloc[0]["price_source"], "itemordershistogram")
+
+    def test_build_lowest_listing_snapshot_dataframe_creates_row_when_render_has_no_listings(self):
+        fake_payload = {
+            "success": True,
+            "total_count": 0,
+            "listinginfo": {},
+            "assets": {},
+        }
+
+        with patch("steam_market_to_excel.steam_render_page", return_value=fake_payload):
+            with patch("steam_market_to_excel.fetch_commodity_lowest_price", return_value=(0.97, "itemordershistogram")):
+                dataframe = sme.build_lowest_listing_snapshot_dataframe(
+                    session=Mock(),
+                    market_hash_name="Fracture Case",
+                    currency=1,
+                    country="US",
+                    language="english",
+                    steam_max_retries=1,
+                )
+
+        self.assertEqual(len(dataframe), 1)
+        self.assertEqual(dataframe.iloc[0]["price"], 0.97)
+        self.assertEqual(dataframe.iloc[0]["price_source"], "itemordershistogram")
+        self.assertEqual(dataframe.iloc[0]["listing_id"], "")
 
     def test_save_table_and_load_table_support_csv(self):
         dataframe = sme.rows_to_dataframe(
@@ -801,6 +1153,25 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertEqual(display_dataframe.iloc[0]["price"], "2.00")
         self.assertEqual(display_dataframe.iloc[0]["stickers"], "yes")
 
+    def test_build_show_dataframe_leaves_missing_sticker_values_blank(self):
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "page": 1,
+                    "float": None,
+                    "price": 2.45,
+                    "has_stickers": None,
+                    "wear": None,
+                    "paint_seed": None,
+                    "listing_id": "case-row",
+                }
+            ]
+        )
+
+        display_dataframe = sme.build_show_dataframe(dataframe)
+
+        self.assertEqual(display_dataframe.iloc[0]["stickers"], "")
+
     def test_format_terminal_table_draws_a_readable_grid(self):
         source_dataframe = pd.DataFrame(
             [
@@ -861,13 +1232,44 @@ class TestListingAndExportFlow(unittest.TestCase):
                 sme.run_fetch(args)
 
         output_text = buffer.getvalue()
-        output_path = temp_dir / "ak_47_safari_mesh_minimal_wear.xlsx"
+        output_path = temp_dir / "skins" / "ak_47_safari_mesh_minimal_wear.xlsx"
         self.assertTrue(output_path.exists())
         self.assertIn(str(output_path), output_text)
         self.assertTrue(
             "Exported 1 listings to" in output_text
             or "Synced 1 current listings to" in output_text
         )
+
+    @patch("steam_market_to_excel.build_lowest_listing_snapshot_dataframe")
+    @patch("steam_market_to_excel.iter_listings")
+    @patch("steam_market_to_excel.requests.Session")
+    def test_fetch_market_dataframe_uses_lowest_listing_snapshot_for_no_wear_items(
+        self,
+        mocked_session_cls,
+        mocked_iter_listings,
+        mocked_build_lowest_listing_snapshot_dataframe,
+    ):
+        mocked_session = Mock()
+        mocked_session.headers = Mock()
+        mocked_session.headers.update = Mock()
+        mocked_session_cls.return_value = mocked_session
+        mocked_build_lowest_listing_snapshot_dataframe.return_value = pd.DataFrame(
+            [{"listing_id": "listing-1", "price": 1.15, "wear": None}]
+        )
+        args = argparse.Namespace(
+            currency=1,
+            country="US",
+            language="english",
+            steam_page_delay=0.5,
+            steam_max_retries=1,
+        )
+
+        dataframe = sme.fetch_market_dataframe(args, "Gallery Case")
+
+        mocked_build_lowest_listing_snapshot_dataframe.assert_called_once()
+        mocked_iter_listings.assert_not_called()
+        self.assertEqual(len(dataframe), 1)
+        self.assertEqual(dataframe.iloc[0]["price"], 1.15)
 
     @patch("steam_market_to_excel.iter_listings")
     @patch("steam_market_to_excel.requests.Session")
@@ -979,7 +1381,8 @@ class TestListingAndExportFlow(unittest.TestCase):
         ]
 
         temp_dir = make_workspace_temp_dir("run_fetch_sync")
-        existing_output_path = temp_dir / "ak_47_safari_mesh_minimal_wear.xlsx"
+        existing_output_path = temp_dir / "skins" / "ak_47_safari_mesh_minimal_wear.xlsx"
+        existing_output_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             [
                 {"listing_id": "listing-1", "price": 1.0},
@@ -1009,6 +1412,73 @@ class TestListingAndExportFlow(unittest.TestCase):
         self.assertEqual(set(synced_dataframe["listing_id"]), {"listing-2", "listing-3"})
         self.assertIn("Synced 2 current listings", output_text)
         self.assertIn("added 1, removed 1, unchanged 1", output_text)
+
+    def test_sync_market_dataframe_appends_no_wear_price_history(self):
+        temp_dir = make_workspace_temp_dir("sync_no_wear_history")
+        output_path = temp_dir / "cases" / "gallery_case.xlsx"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_dataframe = pd.DataFrame(
+            [
+                {
+                    "listing_id": "old-listing",
+                    "price": 2.10,
+                    "market_hash_name": "Gallery Case",
+                    "snapshot_date": "2026-04-28",
+                    "snapshot_timestamp": "2026-04-28T12:00:00-07:00",
+                }
+            ]
+        )
+        previous_dataframe.to_excel(output_path, index=False)
+        current_dataframe = pd.DataFrame(
+            [{"listing_id": "new-listing", "price": 2.45, "wear": None}]
+        )
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            result = sme.sync_market_dataframe(
+                dataframe=current_dataframe,
+                market_hash_name="Gallery Case",
+                output_name=None,
+                update_latest=False,
+            )
+
+        saved_dataframe = pd.read_excel(output_path)
+        self.assertEqual(len(saved_dataframe), 2)
+        self.assertEqual(saved_dataframe.iloc[0]["listing_id"], "old-listing")
+        self.assertEqual(saved_dataframe.iloc[1]["listing_id"], "new-listing")
+        self.assertIn("snapshot_date", saved_dataframe.columns)
+        self.assertIn("snapshot_timestamp", saved_dataframe.columns)
+        self.assertIn("Appended 1 lowest-price snapshot row(s)", sme.build_fetch_result_summary(result))
+
+    def test_sync_market_dataframe_keeps_no_wear_history_when_current_snapshot_is_empty(self):
+        temp_dir = make_workspace_temp_dir("sync_no_wear_history_empty")
+        output_path = temp_dir / "cases" / "gallery_case.xlsx"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_dataframe = pd.DataFrame(
+            [
+                {
+                    "listing_id": "old-listing",
+                    "price": 2.10,
+                    "market_hash_name": "Gallery Case",
+                    "snapshot_date": "2026-04-28",
+                    "snapshot_timestamp": "2026-04-28T12:00:00-07:00",
+                }
+            ]
+        )
+        previous_dataframe.to_excel(output_path, index=False)
+
+        with patch.object(sme, "DEFAULT_OUTPUT_DIR", temp_dir):
+            result = sme.sync_market_dataframe(
+                dataframe=pd.DataFrame(columns=previous_dataframe.columns),
+                market_hash_name="Gallery Case",
+                output_name=None,
+                update_latest=False,
+            )
+
+        saved_dataframe = pd.read_excel(output_path)
+        self.assertEqual(len(saved_dataframe), 1)
+        self.assertEqual(saved_dataframe.iloc[0]["listing_id"], "old-listing")
+        self.assertIn("Steam did not return a current active listing price", sme.build_fetch_result_summary(result))
+        self.assertIn("Kept 1 historical snapshot row(s)", sme.build_fetch_result_summary(result))
 
     @patch("steam_market_to_excel.fetch_market_dataframe")
     def test_run_fetch_many_processes_multiple_items(self, mocked_fetch_market_dataframe):
@@ -1050,8 +1520,8 @@ class TestListingAndExportFlow(unittest.TestCase):
                 sme.run_fetch_many(args)
 
         output_text = buffer.getvalue()
-        self.assertTrue((temp_dir / "ak_47_redline_field_tested.xlsx").exists())
-        self.assertTrue((temp_dir / "m4a1_s_basilisk_field_tested.xlsx").exists())
+        self.assertTrue((temp_dir / "skins" / "ak_47_redline_field_tested.xlsx").exists())
+        self.assertTrue((temp_dir / "skins" / "m4a1_s_basilisk_field_tested.xlsx").exists())
         self.assertIn("Fetching 2 items with 1 worker(s)...", output_text)
 
     def test_run_sort_creates_sorted_output_file(self):
